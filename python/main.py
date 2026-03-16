@@ -745,7 +745,7 @@ def user_loop() -> None:
 
 class Runtime:
     def __init__(self) -> None:
-        self.host = os.getenv("RETROARCH_HOST", DEFAULT_HOST)
+        self.host = os.getenv("HOST_IP", DEFAULT_HOST)
         self.port = int(os.getenv("RETROARCH_PORT", DEFAULT_PORT))
         self.timeout = float(os.getenv("RETROARCH_TIMEOUT", DEFAULT_TIMEOUT))
         self.profiles_dir = Path(os.getenv("PROFILES_DIR", str(DEFAULT_PROFILES_DIR)))
