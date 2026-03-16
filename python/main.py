@@ -132,35 +132,6 @@ class ArduinoBridgePublisher:
             self._safe_call("set_payload_json", payload_json)
             self.last_payload_json = payload_json
 
-        field_map = {
-            "p1_hp": "set_p1_hp",
-            "p2_hp": "set_p2_hp",
-            "p1_shadow": "set_p1_shadow",
-            "p2_shadow": "set_p2_shadow",
-            "p1_score": "set_p1_score",
-            "p2_score": "set_p2_score",
-            "p1_miss": "set_p1_miss",
-            "p1_poor": "set_p1_poor",
-            "p1_good": "set_p1_good",
-            "p1_nice": "set_p1_nice",
-            "p2_miss": "set_p2_miss",
-            "p2_poor": "set_p2_poor",
-            "p2_good": "set_p2_good",
-            "p2_nice": "set_p2_nice",
-        }
-
-        for field_name, method_name in field_map.items():
-            value = data.get(field_name) if isinstance(data, dict) else None
-            if value is None:
-                continue
-            try:
-                numeric = int(value)
-            except (TypeError, ValueError):
-                continue
-            if self.last_sent_fields.get(field_name) != numeric:
-                self._safe_call(method_name, numeric)
-                self.last_sent_fields[field_name] = numeric
-
         heartbeat_bucket = int(time.time())
         if heartbeat_bucket != self.last_heartbeat_bucket:
             self._safe_call("set_unix_time", heartbeat_bucket)
