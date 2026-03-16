@@ -4,15 +4,23 @@
 
 namespace {
 constexpr uint8_t STATE_STARTING = 0;
-constexpr uint8_t STATE_DISCONNECTED = 1;
-constexpr uint8_t STATE_WAITING_CONTENT = 2;
+constexpr uint8_t STATE_DISCONNECTED = 1;      // Waiting for RetroArch
+constexpr uint8_t STATE_WAITING_CONTENT = 2;   // Connected Waiting for Content
 constexpr uint8_t STATE_SWITCHING_GAME = 3;
 constexpr uint8_t STATE_PLAYING = 4;
+constexpr uint8_t STATE_ERROR = 255;
+
+constexpr unsigned long HEARTBEAT_TIMEOUT_MS = 3500;
+constexpr unsigned long DOUBLE_BLINK_GAP_MS = 120;
+constexpr unsigned long DOUBLE_BLINK_PAUSE_MS = 900;
+constexpr unsigned long FLICKER_STEP_MS = 70;
+constexpr unsigned long ERROR_BLINK_MS = 120;
 
 volatile uint8_t lifecycleState = STATE_STARTING;
 String currentGame = "";
 String lastPayloadJson = "{}";
 uint32_t lastUnixTime = 0;
+unsigned long lastHeartbeatSeenMs = 0;
 
 uint16_t p1Score = 0;
 uint16_t p2Score = 0;
@@ -29,7 +37,7 @@ uint8_t p2Poor = 0;
 uint8_t p2Good = 0;
 uint8_t p2Nice = 0;
 
-unsigned long lastBlinkMs = 0;
+unsigned long lastLedStepMs = 0;
 bool ledState = false;
 
 void applyLed(bool on) {
@@ -38,12 +46,53 @@ void applyLed(bool on) {
 }
 
 void blinkPattern(unsigned long now, unsigned long intervalMs) {
-  if (now - lastBlinkMs < intervalMs) {
+  if (now - lastLedStepMs < intervalMs) {
     return;
   }
-  lastBlinkMs = now;
+  lastLedStepMs = now;
   ledState = !ledState;
   applyLed(ledState);
+}
+
+void slowPulsePattern(unsigned long now) {
+  // Digital-only approximation of a slow pulse:
+  // long on / long off gives a calm, readable heartbeat-like cadence.
+  constexpr unsigned long pulseCycleMs = 1600;
+  const unsigned long phase = now % pulseCycleMs;
+  const bool on = (phase < 900);
+  if (on != ledState) {
+    ledState = on;
+    applyLed(ledState);
+  }
+}
+
+void doubleBlinkPattern(unsigned long now) {
+  // Two short flashes, then a pause.
+  constexpr unsigned long cycleMs = (DOUBLE_BLINK_GAP_MS * 2) + 180 + DOUBLE_BLINK_PAUSE_MS;
+  const unsigned long phase = now % cycleMs;
+
+  bool on = false;
+  if (phase < 90) {
+    on = true;
+  } else if (phase >= 90 + DOUBLE_BLINK_GAP_MS && phase < 180 + DOUBLE_BLINK_GAP_MS) {
+    on = true;
+  }
+
+  if (on != ledState) {
+    ledState = on;
+    applyLed(ledState);
+  }
+}
+
+void rapidFlickerPattern(unsigned long now) {
+  blinkPattern(now, FLICKER_STEP_MS);
+}
+
+void solidOnPattern() {
+  if (!ledState) {
+    ledState = true;
+    applyLed(true);
+  }
 }
 
 void set_lifecycle_state(int stateCode) {
@@ -60,6 +109,7 @@ void set_payload_json(String payload) {
 
 void set_unix_time(unsigned long unixTime) {
   lastUnixTime = unixTime;
+  lastHeartbeatSeenMs = millis();
 }
 
 void set_p1_score(unsigned int value) { p1Score = static_cast<uint16_t>(value); }
@@ -100,6 +150,7 @@ int get_p2_nice() { return p2Nice; }
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   applyLed(false);
+  lastHeartbeatSeenMs = millis();
 
   Bridge.begin();
   Bridge.provide("set_lifecycle_state", set_lifecycle_state);
@@ -144,26 +195,31 @@ void setup() {
 
 void loop() {
   const unsigned long now = millis();
+  const bool heartbeatStale = (now - lastHeartbeatSeenMs) > HEARTBEAT_TIMEOUT_MS;
+
+  if (heartbeatStale && lifecycleState != STATE_STARTING) {
+    blinkPattern(now, ERROR_BLINK_MS);
+    return;
+  }
 
   switch (lifecycleState) {
     case STATE_STARTING:
-      blinkPattern(now, 150);
+      blinkPattern(now, 200);
       break;
     case STATE_DISCONNECTED:
-      blinkPattern(now, 500);
+      slowPulsePattern(now);
       break;
     case STATE_WAITING_CONTENT:
-      blinkPattern(now, 1000);
+      doubleBlinkPattern(now);
       break;
     case STATE_SWITCHING_GAME:
-      blinkPattern(now, 250);
+      rapidFlickerPattern(now);
       break;
     case STATE_PLAYING:
-      ledState = true;
-      applyLed(true);
+      solidOnPattern();
       break;
     default:
-      blinkPattern(now, 750);
+      blinkPattern(now, ERROR_BLINK_MS);
       break;
   }
 }
