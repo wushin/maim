@@ -12,3 +12,10 @@ fields:
   p1_poor: { addr: 0x0750, type: u8 }
   p1_good: { addr: 0x0752, type: u8 }
   p1_nice: { addr: 0x0754, type: u8 }
+triggers:
+  - field: p1_hp
+    op: "<"
+    send: hp_down
+  - field: p1_hp
+    op: ">"
+    send: hp_up

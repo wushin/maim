@@ -174,6 +174,41 @@ class ArduinoBridgePublisher:
 
 
 BRIDGE_PUBLISHER = ArduinoBridgePublisher()
+LAST_TRIGGER_VALUES = {}
+
+def process_triggers(profile: dict, current: dict):
+    triggers = profile.get("triggers") or []
+    for rule in triggers:
+        field = rule.get("field")
+        op = rule.get("op")
+        event = rule.get("send")
+
+        if field not in current:
+            continue
+
+        value = current.get(field)
+        prev = LAST_TRIGGER_VALUES.get(field)
+
+        LAST_TRIGGER_VALUES[field] = value
+
+        if prev is None or value is None:
+            continue
+
+        fire = False
+
+        if op == "<" and value < prev:
+            fire = True
+        elif op == ">" and value > prev:
+            fire = True
+        elif op == "=" and value == prev:
+            fire = True
+
+        if fire:
+            try:
+                Bridge.call("trigger_event", str(event))
+            except Exception:
+                pass
+
 
 
 def html_page() -> str:
@@ -803,6 +838,7 @@ class Runtime:
                 self._reload_profile_state()
                 return
             current = snapshot(self.client, self.fields)
+            process_triggers(self.profile, current)
             if current != self.last_data or self.last_state != "playing":
                 set_http_state(watcher_status=f"Current Game: {self.active_title}")
                 emit_payload(self.active_title, "playing", current)
