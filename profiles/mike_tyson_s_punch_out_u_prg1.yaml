@@ -1,0 +1,18 @@
+game: punch_out
+system: nes
+poll_seconds: 0.10
+fields:
+  current_match:         { addr: 0x0001, type: u8 }
+  opponent_rom_bank:     { addr: 0x0002, type: u8 }
+  opponent_matchup_part: { addr: 0x0003, type: u8 }
+  password_type:         { addr: 0x000B, type: u8 }
+  mac_hearts:            { addr: 0x0398, type: u8 }
+  mac_stars:             { addr: 0x039A, type: u8 }
+  mac_knockdowns:        { addr: 0x039C, type: u8 }
+  opponent_hp:           { addr: 0x0396, type: u8 }
+  opponent_knockdowns:   { addr: 0x039E, type: u8 }
+  round_number:          { addr: 0x0300, type: u8 }
+  fight_timer_seconds:   { addr: 0x0301, type: u8 }
+  fight_timer_frames:    { addr: 0x0302, type: u8 }
+  fight_state:           { addr: 0x0305, type: u8 }
+  between_round_flag:    { addr: 0x0306, type: u8 }

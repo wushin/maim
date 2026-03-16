@@ -1,0 +1,14 @@
+game: hyperbeatz
+system: nes
+poll_seconds: 0.10
+fields:
+  p1_hp: { addr: 0x0035, type: u8 }
+  p2_hp: { addr: 0x0036, type: u8 }
+  p1_shadow: { addr: 0x0037, type: u8 }
+  p2_shadow: { addr: 0x0038, type: u8 }
+  p1_score: { addr: 0x0740, type: u16, endian: little }
+  p2_score: { addr: 0x0742, type: u16, endian: little }
+  p1_miss: { addr: 0x074E, type: u8 }
+  p1_poor: { addr: 0x0750, type: u8 }
+  p1_good: { addr: 0x0752, type: u8 }
+  p1_nice: { addr: 0x0754, type: u8 }

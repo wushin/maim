@@ -1,0 +1,22 @@
+name: RetroArch Watcher Bridge
+description: RetroArch watcher ported to Arduino UNO Q App Lab with Python-to-MCU Bridge calls
+version: "1.0.0"
+
+icon:
+
+python:
+  entrypoint: main.py
+
+ports:
+  - port: 42069
+
+env:
+  RETROARCH_HOST: "127.0.0.1"
+  RETROARCH_PORT: "55355"
+  DEBUG_TITLE: "0"
+  AUTO_SCAFFOLD_PROFILE: "1"
+  SCAFFOLD_MARK_GENERATED: "1"
+  WATCHER_HTTP_HOST: "0.0.0.0"
+  WATCHER_HTTP_PORT: "42069"
+
+bricks: []

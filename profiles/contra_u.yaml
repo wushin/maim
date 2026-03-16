@@ -1,0 +1,12 @@
+game: contra_u
+system: nes
+poll_seconds: 0.10
+fields:
+  current_level: { addr: 0x0030, type: u8 }
+  p1_lives: { addr: 0x0032, type: u8 }
+  p2_lives: { addr: 0x0033, type: u8 }
+  p1_game_over: { addr: 0x0038, type: u8 }
+  p2_game_over: { addr: 0x0039, type: u8 }
+  continues_remaining: { addr: 0x003A, type: u8 }
+  boss_defeated: { addr: 0x003B, type: u8 }
+  konami_code_status:  { addr: 0x0024, type: u8 }
