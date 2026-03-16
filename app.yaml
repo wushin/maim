@@ -8,7 +8,7 @@ python:
   entrypoint: main.py
 
 ports:
-  - port: 42069
+  - 42069
 
 env:
   RETROARCH_HOST: "127.0.0.1"
