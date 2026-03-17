@@ -89,55 +89,20 @@ const uint8_t* const MAIM_GLYPHS[] = {
 constexpr uint8_t GLYPH_COUNT = sizeof(MAIM_GLYPHS) / sizeof(MAIM_GLYPHS[0]);
 constexpr uint8_t MESSAGE_WIDTH = (GLYPH_COUNT * (GLYPH_WIDTH + GLYPH_SPACING)) + MATRIX_WIDTH;
 
-unsigned long lastBlinkMs = 0;
-bool ledState = false;
-
 void applyLed(bool on) {
   // UNO Q built-in LED is active-low in your original working sketch
   digitalWrite(LED_BUILTIN, on ? LOW : HIGH);
 }
 
-void blinkPattern(unsigned long now, unsigned long intervalMs) {
-  if (now - lastBlinkMs < intervalMs) {
-    return;
-  }
-  lastBlinkMs = now;
-  ledState = !ledState;
-  applyLed(ledState);
+void setRgb(bool red, bool green, bool blue) {
+  // Active-low RGB LED.
+  digitalWrite(LED3_R, red ? LOW : HIGH);
+  digitalWrite(LED3_G, green ? LOW : HIGH);
+  digitalWrite(LED3_B, blue ? LOW : HIGH);
 }
 
-void slowPulsePattern(unsigned long now) {
-  // Digital approximation of a slow pulse: long on, long off
-  const unsigned long phase = now % 1600;
-  const bool on = (phase < 950);
-  if (on != ledState) {
-    ledState = on;
-    applyLed(ledState);
-  }
-}
-
-void doubleBlinkPattern(unsigned long now) {
-  // Two short flashes, then pause
-  const unsigned long phase = now % 1300;
-  bool on = false;
-
-  if (phase < 90) {
-    on = true;
-  } else if (phase >= 220 && phase < 310) {
-    on = true;
-  }
-
-  if (on != ledState) {
-    ledState = on;
-    applyLed(ledState);
-  }
-}
-
-void solidOnPattern() {
-  if (!ledState) {
-    ledState = true;
-    applyLed(true);
-  }
+void rgbOff() {
+  setRgb(false, false, false);
 }
 
 bool readGlyphPixel(const uint8_t* glyph, uint8_t row, uint8_t col) {
@@ -244,6 +209,15 @@ unsigned long get_trigger_event_count() { return triggerEventCount; }
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   applyLed(false);
+
+  pinMode(LED3_R, OUTPUT);
+  pinMode(LED3_G, OUTPUT);
+  pinMode(LED3_B, OUTPUT);
+  digitalWrite(LED3_R, HIGH);
+  digitalWrite(LED3_G, HIGH);
+  digitalWrite(LED3_B, HIGH);
+  rgbOff();
+
   pinMode(PIN_HP, OUTPUT);
   pinMode(PIN_NICE, OUTPUT);
 
@@ -276,36 +250,29 @@ void loop() {
 
   updateMarquee(now);
 
-  if (lifecycleState != previousLifecycleState) {
-    previousLifecycleState = lifecycleState;
-    lastBlinkMs = now;
-    ledState = false;
-    applyLed(false);
-  }
-
   switch (lifecycleState) {
     case STATE_STARTING:
-      blinkPattern(now, 150);
+      setRgb(true, true, false);   // Yellow
       break;
 
     case STATE_DISCONNECTED:
-      slowPulsePattern(now);
+      setRgb(true, true, false);   // Orange approximation without PWM
       break;
 
     case STATE_WAITING_CONTENT:
-      doubleBlinkPattern(now);
+      setRgb(true, false, true);   // Purple
       break;
 
     case STATE_SWITCHING_GAME:
-      blinkPattern(now, 90);
+      setRgb(false, false, true);  // Blue
       break;
 
     case STATE_PLAYING:
-      solidOnPattern();
+      setRgb(false, true, false);  // Green
       break;
 
     default:
-      blinkPattern(now, 500);
+      setRgb(true, false, false);  // Red
       break;
   }
 }
