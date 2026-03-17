@@ -17,6 +17,22 @@ String lastTriggerEvent = "";
 uint32_t lastUnixTime = 0;
 uint32_t triggerEventCount = 0;
 
+struct TriggerPinRule {
+  const char* eventName;
+  uint8_t pin;
+  uint8_t level;
+};
+
+constexpr uint8_t PIN_HP = 5;
+constexpr uint8_t PIN_NICE = 6;
+
+const TriggerPinRule TRIGGER_RULES[] = {
+  { "hp_down", PIN_HP, HIGH },
+  { "hp_up",   PIN_HP, LOW  },
+  { "nice",    PIN_NICE, HIGH },
+  { "miss",    PIN_NICE, LOW  },
+};
+
 unsigned long lastBlinkMs = 0;
 bool ledState = false;
 
@@ -91,6 +107,13 @@ void set_unix_time(unsigned long unixTime) {
 void trigger_event(String eventName) {
   lastTriggerEvent = eventName;
   triggerEventCount++;
+
+  for (const auto& rule : TRIGGER_RULES) {
+    if (eventName == rule.eventName) {
+      digitalWrite(rule.pin, rule.level);
+      return;
+    }
+  }
 }
 
 int get_lifecycle_state() { return lifecycleState; }
@@ -105,6 +128,11 @@ unsigned long get_trigger_event_count() { return triggerEventCount; }
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   applyLed(false);
+  pinMode(PIN_HP, OUTPUT);
+  pinMode(PIN_NICE, OUTPUT);
+
+  digitalWrite(PIN_HP, LOW);
+  digitalWrite(PIN_NICE, LOW);
 
   Bridge.begin();
 
