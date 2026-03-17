@@ -61,6 +61,7 @@ LATEST_DEBUG = {
     "watcher_status": "Starting",
 }
 STATE_LOCK = threading.Lock()
+_PROFILE_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def debug_enabled() -> bool:
@@ -78,6 +79,10 @@ def scaffold_mark_generated() -> bool:
 def dbg(msg: str) -> None:
     if debug_enabled():
         print(f"[debug] {msg}", file=sys.stderr, flush=True)
+
+
+class ProfileValidationError(ValueError):
+    pass
 
 
 _UNSET = object()
@@ -111,13 +116,11 @@ class ArduinoBridgePublisher:
         self.last_state: Optional[str] = None
         self.last_game: Optional[str] = None
         self.last_payload_json: Optional[str] = None
-        self.last_sent_fields: dict[str, Optional[int]] = {}
         self.last_heartbeat_bucket: Optional[int] = None
 
     def sync(self, payload: dict) -> None:
         state = str(payload.get("state") or "starting")
         game = str(payload.get("game") or "")
-        data = payload.get("data") or {}
 
         if state != self.last_state:
             self._safe_call("set_lifecycle_state", STATE_CODES.get(state, 0))
@@ -145,41 +148,6 @@ class ArduinoBridgePublisher:
 
 
 BRIDGE_PUBLISHER = ArduinoBridgePublisher()
-LAST_TRIGGER_VALUES = {}
-
-def process_triggers(profile: dict, current: dict):
-    triggers = profile.get("triggers") or []
-    for rule in triggers:
-        field = rule.get("field")
-        op = rule.get("op")
-        event = rule.get("send")
-
-        if field not in current:
-            continue
-
-        value = current.get(field)
-        prev = LAST_TRIGGER_VALUES.get(field)
-
-        LAST_TRIGGER_VALUES[field] = value
-
-        if prev is None or value is None:
-            continue
-
-        fire = False
-
-        if op == "<" and value < prev:
-            fire = True
-        elif op == ">" and value > prev:
-            fire = True
-        elif op == "=" and value == prev:
-            fire = True
-
-        if fire:
-            try:
-                Bridge.call("trigger_event", str(event))
-            except Exception:
-                pass
-
 
 
 def html_page() -> str:
@@ -250,15 +218,12 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-
 <body>
 <header>
   <h1>RetroArch Watcher</h1>
-  <div class=\"small\">Status + profile editor + Arduino bridge</div>
+  <div class=\"small\">Lifecycle + live profile editor</div>
 </header>
 <main>
   <section class=\"card\">
     <h2>Lifecycle</h2>
-    <div id=\"notificationBox\" class=\"notification starting visible\">
-      <div id=\"notificationTitle\" class=\"title\">Starting</div>
-      <div id=\"notificationDesc\" class=\"desc\">Watcher is starting up.</div>
-    </div>
+    <div id=\"notificationBox\" class=\"notification starting\"><div id=\"notificationTitle\" class=\"title\">Watcher Starting</div><div id=\"notificationDesc\" class=\"desc\">The watcher is booting and waiting to establish its first state.</div></div>
     <div class=\"grid\" style=\"margin-bottom:12px;\">
       <div><div class=\"label\">Watcher</div><div id=\"watcherStatus\" class=\"value\">Starting</div></div>
       <div><div class=\"label\">Current Game</div><div id=\"currentGame\" class=\"value\">—</div></div>
@@ -423,106 +388,99 @@ class WatcherHTTPHandler(BaseHTTPRequestHandler):
             if not profile_path.exists():
                 self._send_json({"error": "profile_not_found", "profile": name}, status=404)
                 return
-            self._send_json({"profile": name, "path": str(profile_path), "content": profile_path.read_text(encoding="utf-8")})
+            self._send_json({"profile": name, "content": profile_path.read_text(encoding="utf-8")})
             return
-        if path == "/health":
-            payload = state["payload"]
-            http_state = payload.get("state")
-            status = 200 if http_state in {"playing", "waiting_content"} else 503
-            self._send_json({"ok": status == 200, "state": http_state, "game": payload.get("game"), "timestamp": payload.get("timestamp")}, status=status)
-            return
-        self._send_json({"error": "not_found", "path": path}, status=404)
+        self._send_json({"error": "not_found"}, status=404)
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
-        if path.startswith("/api/profile/"):
-            name = unquote(path[len("/api/profile/"):]).strip()
-            if not name.endswith(".yaml") or "/" in name or "\\" in name or name.startswith("."):
-                self._send_json({"error": "invalid_profile_name"}, status=400)
-                return
-            pdir = self._profiles_dir()
-            pdir.mkdir(parents=True, exist_ok=True)
-            profile_path = pdir / name
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length).decode("utf-8")
-            try:
-                parsed_yaml = yaml.safe_load(raw)
-                if parsed_yaml is None:
-                    parsed_yaml = {}
-                if not isinstance(parsed_yaml, dict):
-                    raise ValueError("YAML root must be a mapping/object.")
-            except Exception as exc:
-                self._send_json({"error": f"invalid_yaml: {exc}"}, status=400)
-                return
-            profile_path.write_text(raw, encoding="utf-8")
-            self._send_json({"ok": True, "profile": name, "path": str(profile_path)})
+        if not path.startswith("/api/profile/"):
+            self._send_json({"error": "not_found"}, status=404)
             return
-        self._send_json({"error": "not_found", "path": path}, status=404)
+        name = unquote(path[len("/api/profile/"):]).strip()
+        if not name.endswith(".yaml") or "/" in name or "\\" in name or name.startswith("."):
+            self._send_json({"error": "invalid_profile_name"}, status=400)
+            return
+        profile_path = self._profiles_dir() / name
+        if not profile_path.exists():
+            self._send_json({"error": "profile_not_found", "profile": name}, status=404)
+            return
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(content_length).decode("utf-8")
+        try:
+            parsed = yaml.safe_load(raw)
+            normalize_profile(parsed)
+        except yaml.YAMLError as exc:
+            self._send_json({"error": f"invalid_yaml: {exc}"}, status=400)
+            return
+        except ProfileValidationError as exc:
+            self._send_json({"error": f"invalid_profile: {exc}"}, status=400)
+            return
+        profile_path.write_text(raw, encoding="utf-8")
+        _PROFILE_CACHE.pop(str(profile_path), None)
+        self._send_json({"ok": True, "profile": name})
 
-    def log_message(self, format, *args):
-        return
+    def log_message(self, fmt: str, *args: Any) -> None:
+        dbg(f"HTTP {self.address_string()} - {fmt % args}")
 
 
 def start_http_server(host: str, port: int) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), WatcherHTTPHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=server.serve_forever, name="watcher-http", daemon=True)
     thread.start()
-    print(f"HTTP endpoint listening on http://{host}:{port}", file=sys.stderr, flush=True)
+    print(f"HTTP UI listening on http://{host}:{port}", file=sys.stderr, flush=True)
     return server
 
 
 class RA:
-    def __init__(self, host: str, port: int, timeout: float = DEFAULT_TIMEOUT):
+    def __init__(self, host: str, port: int, timeout: float = DEFAULT_TIMEOUT) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
 
-    def cmd(self, command: str) -> str:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(self.timeout)
-        try:
-            sock.sendto(command.encode(), (self.host, self.port))
-            data, _ = sock.recvfrom(4096)
-            decoded = data.decode(errors="replace").strip()
-            dbg(f"{command} -> {decoded!r}")
-            return decoded
-        finally:
-            sock.close()
+    def _cmd(self, cmd: str) -> str:
+        payload = (cmd + "\n").encode("utf-8")
+        dbg(f"RA UDP -> {self.host}:{self.port} :: {cmd}")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(self.timeout)
+            sock.sendto(payload, (self.host, self.port))
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    chunk, _addr = sock.recvfrom(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\n" in chunk:
+                    break
+        raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
+        dbg(f"RA UDP <- {raw!r}")
+        return raw
 
     def status(self) -> str:
-        return self.cmd("GET_STATUS")
+        return self._cmd("GET_STATUS")
 
     def title(self) -> str:
-        try:
-            return self.cmd("GET_TITLE")
-        except (TimeoutError, socket.timeout):
-            dbg("GET_TITLE timed out")
-            return ""
-        except OSError as exc:
-            dbg(f"GET_TITLE socket error: {exc}")
-            return ""
+        return self._cmd("GET_TITLE")
 
-    def read_u8(self, addr: int):
+    def read_u8(self, addr: int) -> Optional[int]:
         try:
-            response = self.cmd(f"READ_CORE_MEMORY {addr:04x} 1")
-            if "-1" in response:
-                return None
-            return int(response.split()[-1], 16)
-        except (TimeoutError, socket.timeout):
-            dbg(f"READ_CORE_MEMORY {addr:04x} timed out")
+            raw = self._cmd(f"READ_CORE_MEMORY {addr} 1")
+        except Exception:
+            raise
+        if not raw:
             return None
-        except (OSError, ValueError, IndexError) as exc:
-            dbg(f"READ_CORE_MEMORY {addr:04x} failed: {exc}")
-            return None
+        match = re.search(r"([0-9A-Fa-f]{2})\b", raw)
+        return int(match.group(1), 16) if match else None
 
-    def read_u16(self, addr: int, endian: str = "little"):
+    def read_u16(self, addr: int, endian: str = "little") -> Optional[int]:
         a = self.read_u8(addr)
         b = self.read_u8(addr + 1)
         if a is None or b is None:
             return None
         return a | (b << 8) if endian == "little" else (a << 8) | b
-
-
 def slug(title: str) -> str:
     text = title.lower().strip()
     text = re.sub(r"\.[a-z0-9]+$", "", text)
@@ -642,9 +600,293 @@ def get_status_system(client: RA) -> Optional[str]:
         return None
 
 
+def _ensure_mapping(value: Any, label: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ProfileValidationError(f"{label} must be a mapping")
+    return dict(value)
+
+
+def _ensure_list(value: Any, label: str) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    raise ProfileValidationError(f"{label} must be a list")
+
+
+def normalize_field_spec(field_name: str, spec: Any) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        raise ProfileValidationError(f"field '{field_name}' must be a mapping")
+    if "addr" not in spec:
+        raise ProfileValidationError(f"field '{field_name}' is missing addr")
+    if "type" not in spec:
+        raise ProfileValidationError(f"field '{field_name}' is missing type")
+    field_type = str(spec["type"]).strip().lower()
+    if field_type not in {"u8", "u16"}:
+        raise ProfileValidationError(f"field '{field_name}' has unsupported type '{field_type}'")
+    addr = spec["addr"]
+    if isinstance(addr, str):
+        try:
+            int(addr, 0)
+        except ValueError as exc:
+            raise ProfileValidationError(f"field '{field_name}' has invalid addr '{addr}'") from exc
+    elif not isinstance(addr, int):
+        raise ProfileValidationError(f"field '{field_name}' addr must be int or string")
+    normalized = {"addr": addr, "type": field_type}
+    if field_type == "u16":
+        endian = str(spec.get("endian", "little")).strip().lower()
+        if endian not in {"little", "big"}:
+            raise ProfileValidationError(f"field '{field_name}' has invalid endian '{endian}'")
+        normalized["endian"] = endian
+    return normalized
+
+
+def _normalize_compare(value: Any) -> str:
+    compare = str(value or "changed").strip().lower().replace(" ", "_")
+    aliases = {
+        "<": "decreased",
+        ">": "increased",
+        "=": "unchanged",
+        "==": "equal",
+        "!=": "not_equal",
+        "less_than": "below",
+        "greater_than": "above",
+    }
+    compare = aliases.get(compare, compare)
+    supported = {
+        "decreased",
+        "increased",
+        "changed",
+        "unchanged",
+        "equal",
+        "not_equal",
+        "above",
+        "above_or_equal",
+        "below",
+        "below_or_equal",
+        "crossed_above",
+        "crossed_below",
+        "delta_gt",
+        "delta_gte",
+        "delta_lt",
+        "delta_lte",
+        "became_zero",
+        "became_nonzero",
+    }
+    if compare not in supported:
+        raise ProfileValidationError(f"unsupported trigger compare '{compare}'")
+    return compare
+
+
+def normalize_condition(condition: Any, fields: dict[str, Any], *, label: str = "when") -> dict[str, Any]:
+    if not isinstance(condition, dict):
+        raise ProfileValidationError(f"{label} must be a mapping")
+    if "all" in condition:
+        clauses = _ensure_list(condition.get("all"), f"{label}.all")
+        if not clauses:
+            raise ProfileValidationError(f"{label}.all must not be empty")
+        return {"all": [normalize_condition(item, fields, label=f"{label}.all") for item in clauses]}
+    if "any" in condition:
+        clauses = _ensure_list(condition.get("any"), f"{label}.any")
+        if not clauses:
+            raise ProfileValidationError(f"{label}.any must not be empty")
+        return {"any": [normalize_condition(item, fields, label=f"{label}.any") for item in clauses]}
+
+    field = str(condition.get("field") or "").strip()
+    if not field:
+        raise ProfileValidationError(f"{label} is missing field")
+    if field not in fields:
+        raise ProfileValidationError(f"{label} references unknown field '{field}'")
+
+    compare = _normalize_compare(condition.get("compare") or condition.get("op") or "changed")
+    normalized: dict[str, Any] = {"field": field, "compare": compare}
+
+    if "value_field" in condition and "field_value" in condition:
+        raise ProfileValidationError(f"{label} must not define both value_field and field_value")
+    rhs_field = condition.get("value_field", condition.get("field_value"))
+    if rhs_field is not None:
+        rhs_field = str(rhs_field).strip()
+        if rhs_field not in fields:
+            raise ProfileValidationError(f"{label} references unknown value_field '{rhs_field}'")
+        normalized["value_field"] = rhs_field
+    elif "value" in condition:
+        normalized["value"] = condition["value"]
+
+    if "delta" in condition:
+        normalized["delta"] = condition["delta"]
+    return normalized
+
+
+def normalize_action(action: Any, event_name: str) -> dict[str, Any]:
+    if not isinstance(action, dict):
+        raise ProfileValidationError(f"event '{event_name}' action must be a mapping")
+    if "pin" not in action:
+        raise ProfileValidationError(f"event '{event_name}' action is missing pin")
+
+    pin = action["pin"]
+    if not isinstance(pin, int):
+        raise ProfileValidationError(f"event '{event_name}' action pin must be an integer")
+
+    raw_behavior = str(action.get("behavior", action.get("mode", "set"))).strip().lower().replace(" ", "_")
+    aliases = {
+        "on": "set",
+        "off": "set",
+        "hold": "set",
+        "vibration": "set",
+        "pulse_vibration": "pulse",
+    }
+    behavior = aliases.get(raw_behavior, raw_behavior)
+    if behavior not in {"set", "pulse"}:
+        raise ProfileValidationError(f"event '{event_name}' has unsupported behavior '{raw_behavior}'")
+
+    active = str(action.get("active", action.get("polarity", "high"))).strip().lower()
+    if active not in {"high", "low"}:
+        raise ProfileValidationError(f"event '{event_name}' action active must be 'high' or 'low'")
+
+    normalized: dict[str, Any] = {
+        "pin": pin,
+        "behavior": behavior,
+        "active": active,
+    }
+
+    if behavior == "set":
+        value = action.get("value", action.get("level", action.get("state", None)))
+        if value is None:
+            if raw_behavior == "off":
+                value = "off"
+            else:
+                value = "on"
+        value_text = str(value).strip().lower()
+        if value_text not in {"on", "off", "high", "low", "1", "0", "true", "false"}:
+            raise ProfileValidationError(f"event '{event_name}' action value must be on/off")
+        normalized["value"] = "on" if value_text in {"on", "high", "1", "true"} else "off"
+        if "duration_ms" in action and action["duration_ms"] is not None:
+            duration_ms = int(action["duration_ms"])
+            if duration_ms < 0:
+                raise ProfileValidationError(f"event '{event_name}' action duration_ms must be >= 0")
+            normalized["duration_ms"] = duration_ms
+    else:
+        on_ms = int(action.get("on_ms", 150))
+        off_ms = int(action.get("off_ms", 150))
+        count = int(action.get("count", 1))
+        if on_ms <= 0 or off_ms < 0 or count <= 0:
+            raise ProfileValidationError(f"event '{event_name}' pulse action must use positive timings/count")
+        normalized["on_ms"] = on_ms
+        normalized["off_ms"] = off_ms
+        normalized["count"] = count
+
+    return normalized
+
+
+def normalize_events(raw_events: Any) -> dict[str, dict[str, Any]]:
+    events = _ensure_mapping(raw_events, "events")
+    normalized: dict[str, dict[str, Any]] = {}
+    for event_name, event_spec in events.items():
+        name = str(event_name).strip()
+        if not name:
+            raise ProfileValidationError("event names must not be empty")
+        if isinstance(event_spec, list):
+            event_spec = {"actions": event_spec}
+        elif not isinstance(event_spec, dict):
+            raise ProfileValidationError(f"event '{name}' must be a mapping or action list")
+        actions = event_spec.get("actions")
+        if actions is None and "pin" in event_spec:
+            actions = [event_spec]
+        actions_list = _ensure_list(actions, f"event '{name}'.actions")
+        if not actions_list:
+            raise ProfileValidationError(f"event '{name}' must define at least one action")
+        normalized[name] = {
+            "name": name,
+            "actions": [normalize_action(action, name) for action in actions_list],
+        }
+    return normalized
+
+
+def normalize_triggers(raw_triggers: Any, fields: dict[str, Any], events: dict[str, Any]) -> list[dict[str, Any]]:
+    items = _ensure_list(raw_triggers, "triggers")
+    normalized: list[dict[str, Any]] = []
+    for index, trigger in enumerate(items):
+        label = f"triggers[{index}]"
+        if not isinstance(trigger, dict):
+            raise ProfileValidationError(f"{label} must be a mapping")
+
+        when = trigger.get("when")
+        if when is None and "field" in trigger:
+            when = {
+                "field": trigger.get("field"),
+                "compare": trigger.get("compare", trigger.get("op", "changed")),
+                **({"value": trigger["value"]} if "value" in trigger else {}),
+                **({"value_field": trigger["value_field"]} if "value_field" in trigger else {}),
+                **({"delta": trigger["delta"]} if "delta" in trigger else {}),
+            }
+        condition = normalize_condition(when, fields, label=f"{label}.when")
+
+        event_names: list[str] = []
+        if "event" in trigger:
+            event_names = [str(trigger["event"]).strip()]
+        elif "events" in trigger:
+            event_names = [str(item).strip() for item in _ensure_list(trigger.get("events"), f"{label}.events")]
+        elif "send" in trigger:
+            event_names = [str(trigger["send"]).strip()]
+        if not event_names:
+            raise ProfileValidationError(f"{label} must define event/events/send")
+        for event_name in event_names:
+            if event_name not in events:
+                raise ProfileValidationError(f"{label} references unknown event '{event_name}'")
+
+        normalized.append(
+            {
+                "name": str(trigger.get("name") or f"trigger_{index + 1}"),
+                "when": condition,
+                "events": event_names,
+            }
+        )
+    return normalized
+
+
+def normalize_profile(raw_profile: Any) -> dict[str, Any]:
+    profile = _ensure_mapping(raw_profile, "profile")
+
+    telemetry = _ensure_mapping(profile.get("telemetry"), "telemetry")
+    raw_fields = telemetry.get("fields")
+    if raw_fields is None:
+        raw_fields = profile.get("fields")
+    fields_map = _ensure_mapping(raw_fields, "telemetry.fields")
+    normalized_fields = {name: normalize_field_spec(name, spec) for name, spec in fields_map.items()}
+
+    raw_events = profile.get("events")
+    normalized_events = normalize_events(raw_events)
+
+    raw_triggers = profile.get("triggers")
+    normalized_triggers = normalize_triggers(raw_triggers, normalized_fields, normalized_events)
+
+    poll_seconds = float(profile.get("poll_seconds", DEFAULT_POLL))
+    if poll_seconds <= 0:
+        raise ProfileValidationError("poll_seconds must be > 0")
+
+    normalized = {
+        "game": str(profile.get("game") or "").strip() or None,
+        "system": str(profile.get("system") or "").strip() or None,
+        "poll_seconds": poll_seconds,
+        "telemetry": {"fields": normalized_fields},
+        "events": normalized_events,
+        "triggers": normalized_triggers,
+        "generated": bool(profile.get("generated", False)),
+    }
+    return normalized
+
+
 def create_profile_scaffold(profile_path: Path, game_slug: str, system: Optional[str]) -> bool:
     profile_path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, Any] = {"game": game_slug, "poll_seconds": DEFAULT_POLL, "fields": {}}
+    payload: dict[str, Any] = {
+        "game": game_slug,
+        "poll_seconds": DEFAULT_POLL,
+        "telemetry": {"fields": {}},
+        "events": {},
+        "triggers": [],
+    }
     if system:
         payload["system"] = system
     if scaffold_mark_generated():
@@ -657,12 +899,19 @@ def create_profile_scaffold(profile_path: Path, game_slug: str, system: Optional
         return False
 
 
-def load_profile(profile_path: Path) -> dict:
-    return yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+def load_profile(profile_path: Path) -> dict[str, Any]:
+    profile_key = str(profile_path)
+    cached = _PROFILE_CACHE.get(profile_key)
+    if cached is not None:
+        return cached
+    parsed = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    normalized = normalize_profile(parsed)
+    _PROFILE_CACHE[profile_key] = normalized
+    return normalized
 
 
-def profile_has_fields(profile: dict) -> bool:
-    fields = profile.get("fields")
+def profile_has_fields(profile: dict[str, Any]) -> bool:
+    fields = profile.get("telemetry", {}).get("fields")
     return isinstance(fields, dict) and len(fields) > 0
 
 
@@ -689,7 +938,12 @@ def wait_for_profile(client: RA, profiles_dir: Path, retry_seconds: float = DEFA
         game_slug = slug(title)
         profile_path = profiles_dir / f"{game_slug}.yaml"
         if profile_path.exists():
-            profile = load_profile(profile_path)
+            try:
+                profile = load_profile(profile_path)
+            except (yaml.YAMLError, ProfileValidationError) as exc:
+                set_http_state(active_title=title, profile_path=str(profile_path), watcher_status=f"Current Game: {title} (Invalid Profile: {exc})")
+                time.sleep(retry_seconds)
+                continue
             if profile_has_fields(profile):
                 set_http_state(active_title=title, profile_path=str(profile_path), watcher_status=f"Current Game: {title}")
                 return profile, title
@@ -707,8 +961,8 @@ def wait_for_profile(client: RA, profiles_dir: Path, retry_seconds: float = DEFA
         time.sleep(retry_seconds)
 
 
-def snapshot(client: RA, fields: dict) -> dict:
-    out = {}
+def snapshot(client: RA, fields: dict[str, Any]) -> dict[str, Optional[int]]:
+    out: dict[str, Optional[int]] = {}
     for name, spec in fields.items():
         addr = spec["addr"]
         if isinstance(addr, str):
@@ -742,6 +996,116 @@ def reconnect_and_reload_profile(client: RA, profiles_dir: Path, connect_retry: 
     return wait_for_profile(client, profiles_dir, retry_seconds=title_retry, scaffolded_once=scaffolded_once)
 
 
+def _current_clause_value(clause: dict[str, Any], current: dict[str, Optional[int]]) -> Any:
+    if "value_field" in clause:
+        return current.get(clause["value_field"])
+    return clause.get("value")
+
+
+def evaluate_condition(condition: dict[str, Any], current: dict[str, Optional[int]], previous: Optional[dict[str, Optional[int]]]) -> bool:
+    if "all" in condition:
+        return all(evaluate_condition(item, current, previous) for item in condition["all"])
+    if "any" in condition:
+        return any(evaluate_condition(item, current, previous) for item in condition["any"])
+
+    field = condition["field"]
+    compare = condition["compare"]
+    cur = current.get(field)
+    prev = None if previous is None else previous.get(field)
+    rhs = _current_clause_value(condition, current)
+    delta = None if prev is None or cur is None else cur - prev
+    threshold = condition.get("delta")
+
+    if compare in {"decreased", "increased", "changed", "unchanged", "crossed_above", "crossed_below", "became_zero", "became_nonzero"} and prev is None:
+        return False
+    if cur is None:
+        return False
+
+    if compare == "decreased":
+        return prev is not None and cur < prev
+    if compare == "increased":
+        return prev is not None and cur > prev
+    if compare == "changed":
+        return prev is not None and cur != prev
+    if compare == "unchanged":
+        return prev is not None and cur == prev
+    if compare == "equal":
+        return rhs is not None and cur == rhs
+    if compare == "not_equal":
+        return rhs is not None and cur != rhs
+    if compare == "above":
+        return rhs is not None and cur > rhs
+    if compare == "above_or_equal":
+        return rhs is not None and cur >= rhs
+    if compare == "below":
+        return rhs is not None and cur < rhs
+    if compare == "below_or_equal":
+        return rhs is not None and cur <= rhs
+    if compare == "crossed_above":
+        return prev is not None and rhs is not None and prev <= rhs < cur
+    if compare == "crossed_below":
+        return prev is not None and rhs is not None and prev >= rhs > cur
+    if compare == "delta_gt":
+        return delta is not None and threshold is not None and delta > threshold
+    if compare == "delta_gte":
+        return delta is not None and threshold is not None and delta >= threshold
+    if compare == "delta_lt":
+        return delta is not None and threshold is not None and delta < threshold
+    if compare == "delta_lte":
+        return delta is not None and threshold is not None and delta <= threshold
+    if compare == "became_zero":
+        return prev is not None and prev != 0 and cur == 0
+    if compare == "became_nonzero":
+        return prev is not None and prev == 0 and cur != 0
+    return False
+
+
+class EventDispatcher:
+    def dispatch(self, event_name: str, event_def: dict[str, Any]) -> None:
+        for action in event_def.get("actions", []):
+            payload = self._serialize_action(event_name, action)
+            try:
+                Bridge.call("trigger_event", payload)
+            except Exception as exc:
+                dbg(f"Bridge trigger_event failed for {event_name}: {exc}")
+
+    @staticmethod
+    def _serialize_action(event_name: str, action: dict[str, Any]) -> str:
+        parts = [
+            f"event={event_name}",
+            f"pin={action['pin']}",
+            f"behavior={action['behavior']}",
+            f"active={action.get('active', 'high')}",
+        ]
+        if action["behavior"] == "set":
+            parts.append(f"value={action.get('value', 'on')}")
+            if action.get("duration_ms") is not None:
+                parts.append(f"duration_ms={action['duration_ms']}")
+        elif action["behavior"] == "pulse":
+            parts.append(f"on_ms={action.get('on_ms', 150)}")
+            parts.append(f"off_ms={action.get('off_ms', 150)}")
+            parts.append(f"count={action.get('count', 1)}")
+        return ";".join(parts)
+
+
+class TriggerEngine:
+    def __init__(self) -> None:
+        self.previous_snapshot: Optional[dict[str, Optional[int]]] = None
+        self.dispatcher = EventDispatcher()
+
+    def reset(self) -> None:
+        self.previous_snapshot = None
+
+    def process(self, profile: dict[str, Any], current: dict[str, Optional[int]]) -> None:
+        previous = self.previous_snapshot
+        for trigger in profile.get("triggers", []):
+            if evaluate_condition(trigger["when"], current, previous):
+                for event_name in trigger.get("events", []):
+                    event_def = profile["events"][event_name]
+                    self.dispatcher.dispatch(event_name, event_def)
+        self.previous_snapshot = dict(current)
+
+
 def user_loop() -> None:
     global RUNTIME
     if RUNTIME is None:
@@ -761,21 +1125,23 @@ class Runtime:
         self.http_port = int(os.getenv("WATCHER_HTTP_PORT", DEFAULT_HTTP_PORT))
         self.client = RA(self.host, self.port, timeout=self.timeout)
         self.scaffolded_once: set[str] = set()
-        self.profile: Optional[dict] = None
+        self.profile: Optional[dict[str, Any]] = None
         self.active_title: Optional[str] = None
+        self.active_profile_path: Optional[Path] = None
         self.poll = DEFAULT_POLL
-        self.fields: dict = {}
-        self.last_data = None
-        self.last_state = None
+        self.fields: dict[str, Any] = {}
+        self.last_data: Optional[dict[str, Optional[int]]] = None
+        self.last_state: Optional[str] = None
         self.next_due = 0.0
+        self.trigger_engine = TriggerEngine()
 
     def start(self) -> None:
         set_http_state(payload=make_payload(None, "starting", None), profiles_dir=str(self.profiles_dir), profile_path=None, active_title=None, watcher_status="Starting")
         publish_bridge_payload(get_http_state()["payload"])
         start_http_server(self.http_host, self.http_port)
         self.profile, self.active_title = reconnect_and_reload_profile(self.client, self.profiles_dir, self.connect_retry, self.title_retry, self.scaffolded_once)
-        self.poll = float(self.profile.get("poll_seconds", DEFAULT_POLL))
-        self.fields = self.profile["fields"]
+        self.active_profile_path = self.profiles_dir / f"{slug(self.active_title or '')}.yaml"
+        self._reload_profile_state()
         self.next_due = time.monotonic()
 
     def tick(self) -> None:
@@ -791,6 +1157,7 @@ class Runtime:
                     self.last_state = "disconnected"
                 set_http_state(active_title=None, profile_path=None, watcher_status="Waiting for RetroArch")
                 self.profile, self.active_title = reconnect_and_reload_profile(self.client, self.profiles_dir, self.connect_retry, self.title_retry, self.scaffolded_once)
+                self.active_profile_path = self.profiles_dir / f"{slug(self.active_title or '')}.yaml"
                 self._reload_profile_state()
                 return
             if state == "no_content":
@@ -799,6 +1166,7 @@ class Runtime:
                     self.last_state = "waiting_content"
                 set_http_state(active_title=None, profile_path=None, watcher_status="Connected Waiting for Content")
                 self.profile, self.active_title = reconnect_and_reload_profile(self.client, self.profiles_dir, self.connect_retry, self.title_retry, self.scaffolded_once)
+                self.active_profile_path = self.profiles_dir / f"{slug(self.active_title or '')}.yaml"
                 self._reload_profile_state()
                 return
             assert current_title is not None
@@ -806,10 +1174,12 @@ class Runtime:
                 emit_payload(self.active_title, "switching_game", None)
                 set_http_state(watcher_status=f"Current Game: {current_title}")
                 self.profile, self.active_title = wait_for_profile(self.client, self.profiles_dir, retry_seconds=self.title_retry, scaffolded_once=self.scaffolded_once)
+                self.active_profile_path = self.profiles_dir / f"{slug(self.active_title or '')}.yaml"
                 self._reload_profile_state()
                 return
             current = snapshot(self.client, self.fields)
-            process_triggers(self.profile, current)
+            assert self.profile is not None
+            self.trigger_engine.process(self.profile, current)
             if current != self.last_data or self.last_state != "playing":
                 set_http_state(watcher_status=f"Current Game: {self.active_title}")
                 emit_payload(self.active_title, "playing", current)
@@ -822,14 +1192,16 @@ class Runtime:
             set_http_state(watcher_status="Waiting for RetroArch")
             print(f"RetroArch connection lost: {exc}", file=sys.stderr, flush=True)
             self.profile, self.active_title = reconnect_and_reload_profile(self.client, self.profiles_dir, self.connect_retry, self.title_retry, self.scaffolded_once)
+            self.active_profile_path = self.profiles_dir / f"{slug(self.active_title or '')}.yaml"
             self._reload_profile_state()
 
     def _reload_profile_state(self) -> None:
         assert self.profile is not None
         self.poll = float(self.profile.get("poll_seconds", DEFAULT_POLL))
-        self.fields = self.profile["fields"]
+        self.fields = dict(self.profile.get("telemetry", {}).get("fields", {}))
         self.last_data = None
         self.last_state = None
+        self.trigger_engine.reset()
         self.next_due = time.monotonic() + min(self.poll, 0.10)
 
 
