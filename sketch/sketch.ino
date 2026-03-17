@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Arduino_RouterBridge.h>
+#include <Arduino_LED_Matrix.h>
 
 namespace {
 constexpr uint8_t STATE_STARTING = 0;
@@ -7,6 +8,12 @@ constexpr uint8_t STATE_DISCONNECTED = 1;    // Waiting for RetroArch
 constexpr uint8_t STATE_WAITING_CONTENT = 2; // Connected Waiting for Content
 constexpr uint8_t STATE_SWITCHING_GAME = 3;
 constexpr uint8_t STATE_PLAYING = 4;
+
+constexpr uint8_t MATRIX_HEIGHT = 8;
+constexpr uint8_t MATRIX_WIDTH = 12;
+constexpr unsigned long MARQUEE_STEP_MS = 35; // fast marquee speed
+constexpr uint8_t GLYPH_WIDTH = 5;
+constexpr uint8_t GLYPH_SPACING = 1;
 
 volatile uint8_t lifecycleState = STATE_STARTING;
 uint8_t previousLifecycleState = 255;
@@ -32,6 +39,55 @@ const TriggerPinRule TRIGGER_RULES[] = {
   { "nice",    PIN_NICE, HIGH },
   { "miss",    PIN_NICE, LOW  },
 };
+
+ArduinoLEDMatrix matrix;
+uint8_t frame[MATRIX_HEIGHT][MATRIX_WIDTH] = {};
+unsigned long lastMarqueeStepMs = 0;
+uint16_t marqueeSubpixelOffset = 0;
+
+// 5x7 glyphs packed as row bitmaps, MSB on the left.
+const uint8_t GLYPH_M[MATRIX_HEIGHT] = {
+  0b10001,
+  0b11011,
+  0b10101,
+  0b10001,
+  0b10001,
+  0b10001,
+  0b10001,
+  0b00000,
+};
+
+const uint8_t GLYPH_A[MATRIX_HEIGHT] = {
+  0b01110,
+  0b10001,
+  0b10001,
+  0b11111,
+  0b10001,
+  0b10001,
+  0b10001,
+  0b00000,
+};
+
+const uint8_t GLYPH_I[MATRIX_HEIGHT] = {
+  0b11111,
+  0b00100,
+  0b00100,
+  0b00100,
+  0b00100,
+  0b00100,
+  0b11111,
+  0b00000,
+};
+
+const uint8_t* const MAIM_GLYPHS[] = {
+  GLYPH_M,
+  GLYPH_A,
+  GLYPH_I,
+  GLYPH_M,
+};
+
+constexpr uint8_t GLYPH_COUNT = sizeof(MAIM_GLYPHS) / sizeof(MAIM_GLYPHS[0]);
+constexpr uint8_t MESSAGE_WIDTH = (GLYPH_COUNT * (GLYPH_WIDTH + GLYPH_SPACING)) + MATRIX_WIDTH;
 
 unsigned long lastBlinkMs = 0;
 bool ledState = false;
@@ -84,6 +140,66 @@ void solidOnPattern() {
   }
 }
 
+bool readGlyphPixel(const uint8_t* glyph, uint8_t row, uint8_t col) {
+  return (glyph[row] >> (GLYPH_WIDTH - 1 - col)) & 0x01;
+}
+
+bool readMessageColumn(uint8_t row, uint16_t column) {
+  if (column < MATRIX_WIDTH) {
+    return false; // leading gap so the word scrolls cleanly onto the display
+  }
+
+  const uint16_t shifted = column - MATRIX_WIDTH;
+  const uint8_t glyphBlockWidth = GLYPH_WIDTH + GLYPH_SPACING;
+  const uint8_t glyphIndex = shifted / glyphBlockWidth;
+  const uint8_t glyphColumn = shifted % glyphBlockWidth;
+
+  if (glyphIndex >= GLYPH_COUNT) {
+    return false; // trailing gap after the word exits the display
+  }
+
+  if (glyphColumn >= GLYPH_WIDTH) {
+    return false; // spacer column between letters
+  }
+
+  return readGlyphPixel(MAIM_GLYPHS[glyphIndex], row, glyphColumn);
+}
+
+void renderMarqueeFrame() {
+  const uint16_t baseColumn = marqueeSubpixelOffset / 2;
+  const bool halfStep = (marqueeSubpixelOffset & 0x01) != 0;
+
+  for (uint8_t y = 0; y < MATRIX_HEIGHT; ++y) {
+    for (uint8_t x = 0; x < MATRIX_WIDTH; ++x) {
+      const uint16_t leftColumn = (baseColumn + x) % MESSAGE_WIDTH;
+      bool pixel = readMessageColumn(y, leftColumn);
+
+      if (halfStep) {
+        const uint16_t rightColumn = (leftColumn + 1) % MESSAGE_WIDTH;
+        const bool rightPixel = readMessageColumn(y, rightColumn);
+
+        // Checkerboard temporal blend between adjacent columns.
+        // This fakes a half-column shift on a 1-bit matrix and makes the
+        // marquee feel smoother than a hard 1-column jump.
+        pixel = ((x + y) & 0x01) ? rightPixel : pixel;
+      }
+
+      frame[y][x] = pixel ? 1 : 0;
+    }
+  }
+
+  matrix.renderBitmap(frame, MATRIX_HEIGHT, MATRIX_WIDTH);
+}
+
+void updateMarquee(unsigned long now) {
+  if (now - lastMarqueeStepMs >= MARQUEE_STEP_MS) {
+    lastMarqueeStepMs = now;
+    marqueeSubpixelOffset = (marqueeSubpixelOffset + 1) % (MESSAGE_WIDTH * 2);
+  }
+
+  renderMarqueeFrame();
+}
+
 void set_lifecycle_state(int stateCode) {
   lifecycleState = static_cast<uint8_t>(stateCode);
 }
@@ -134,6 +250,9 @@ void setup() {
   digitalWrite(PIN_HP, LOW);
   digitalWrite(PIN_NICE, LOW);
 
+  matrix.begin();
+  renderMarqueeFrame();
+
   Bridge.begin();
 
   Bridge.provide("set_lifecycle_state", set_lifecycle_state);
@@ -154,6 +273,8 @@ void setup() {
 
 void loop() {
   const unsigned long now = millis();
+
+  updateMarquee(now);
 
   if (lifecycleState != previousLifecycleState) {
     previousLifecycleState = lifecycleState;
