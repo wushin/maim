@@ -411,7 +411,7 @@ void loop() {
 
   switch (lifecycleState) {
     case STATE_STARTING:
-      setRgb(true, true, false);
+      setRgb(true, true, true);
       break;
 
     case STATE_DISCONNECTED:
@@ -419,7 +419,7 @@ void loop() {
       break;
 
     case STATE_WAITING_CONTENT:
-      setRgb(true, false, false);
+      setRgb(true, false, true);
       break;
 
     case STATE_SWITCHING_GAME:
