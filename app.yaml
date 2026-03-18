@@ -10,6 +10,7 @@ python:
 ports:
   - 42069
   - 4210
+  - 4211
 
 env:
   RETROARCH_PORT: "55355"

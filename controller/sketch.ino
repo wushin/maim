@@ -2,7 +2,7 @@
 #include <WiFiUdp.h>
 #include <BleGamepad.h>
 
-BleGamepad bleGamepad("I Control Them", "MAIM", 100);
+BleGamepad bleGamepad("IControlThem p1", "MAIM", 100);
 
 // =========================
 // Wi-Fi settings
@@ -10,6 +10,9 @@ BleGamepad bleGamepad("I Control Them", "MAIM", 100);
 constexpr char WIFI_SSID[] = "YOUR_WIFI_SSID";
 constexpr char WIFI_PASS[] = "YOUR_WIFI_PASSWORD";
 constexpr uint16_t UDP_PORT = 4210;
+constexpr uint16_t DISCOVERY_REPLY_PORT = 4211;
+constexpr char CONTROLLER_ID[] = "p1";   // Change per controller: p1, p2, p3, etc.
+constexpr char CONTROLLER_NAME[] = "IControlThem p1";
 
 // =========================
 // D-pad pins (digital -> X/Y axes)
@@ -339,6 +342,35 @@ String getToken(const String& input, int index) {
   }
 }
 
+void sendDiscoveryReply(IPAddress targetIp) {
+  String payload = "HELLO_CONTROLLER\n";
+  payload += "id=";
+  payload += CONTROLLER_ID;
+  payload += "\nname=";
+  payload += CONTROLLER_NAME;
+  payload += "\nhost=";
+  payload += WiFi.localIP().toString();
+  payload += "\nport=";
+  payload += String(UDP_PORT);
+  payload += "\nrole=controller\n";
+
+  udp.beginPacket(targetIp, DISCOVERY_REPLY_PORT);
+  udp.write((const uint8_t*)payload.c_str(), payload.length());
+  udp.endPacket();
+
+  Serial.print("Discovery reply sent to ");
+  Serial.print(targetIp);
+  Serial.print(":");
+  Serial.println(DISCOVERY_REPLY_PORT);
+}
+
+bool isDiscoveryProbe(const String& cmd) {
+  return cmd == "DISCOVER_CONTROLLERS" ||
+         cmd == "DISCOVER" ||
+         cmd == "WHO_IS_OUT_THERE" ||
+         cmd == "WHO_ARE_YOU";
+}
+
 void handleNamedEvent(const String& cmd) {
   if (cmd == "HIT_STRONG") {
     for (uint8_t i = 0; i < RUMBLE_COUNT; i++) {
@@ -369,12 +401,17 @@ void handleNamedEvent(const String& cmd) {
   }
 }
 
-void processUdpCommand(String cmd) {
+void processUdpCommand(String cmd, IPAddress remoteIp) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
   Serial.print("UDP cmd: ");
   Serial.println(cmd);
+
+  if (isDiscoveryProbe(cmd)) {
+    sendDiscoveryReply(remoteIp);
+    return;
+  }
 
   if (cmd == "HIT_STRONG" ||
       cmd == "HIT_LIGHT" ||
@@ -397,7 +434,6 @@ void processUdpCommand(String cmd) {
   }
 
   // RUMBLE <motor> <ms>
-  // Example: RUMBLE 1 150
   if (cmd.startsWith("RUMBLE ")) {
     int motorId = getToken(cmd, 1).toInt();
     uint16_t ms = (uint16_t)getToken(cmd, 2).toInt();
@@ -410,7 +446,6 @@ void processUdpCommand(String cmd) {
   }
 
   // RUMBLE_ALL <ms>
-  // Example: RUMBLE_ALL 150
   if (cmd.startsWith("RUMBLE_ALL ")) {
     uint16_t ms = (uint16_t)getToken(cmd, 1).toInt();
     if (ms > 0) {
@@ -422,7 +457,6 @@ void processUdpCommand(String cmd) {
   }
 
   // PULSE <motor> <on_ms> <off_ms> <count>
-  // Example: PULSE 2 120 80 2
   if (cmd.startsWith("PULSE ")) {
     int motorId = getToken(cmd, 1).toInt();
     uint16_t onMs = (uint16_t)getToken(cmd, 2).toInt();
@@ -437,7 +471,6 @@ void processUdpCommand(String cmd) {
   }
 
   // REPEAT <motor> <on_ms> <off_ms>
-  // Example: REPEAT 1 120 280
   if (cmd.startsWith("REPEAT ")) {
     int motorId = getToken(cmd, 1).toInt();
     uint16_t onMs = (uint16_t)getToken(cmd, 2).toInt();
@@ -451,7 +484,6 @@ void processUdpCommand(String cmd) {
   }
 
   // STOP <motor>
-  // Example: STOP 3
   if (cmd.startsWith("STOP ")) {
     int motorId = getToken(cmd, 1).toInt();
     int motorIndex = motorIdToIndex(motorId);
@@ -463,7 +495,6 @@ void processUdpCommand(String cmd) {
   }
 
   // STATE <name>
-  // Example: STATE playing
   if (cmd.startsWith("STATE ")) {
     String state = cmd.substring(6);
     state.trim();
@@ -472,7 +503,6 @@ void processUdpCommand(String cmd) {
   }
 
   // RGB <r> <g> <b>
-  // Example: RGB 1 0 1
   if (cmd.startsWith("RGB ")) {
     bool r = getToken(cmd, 1).toInt() != 0;
     bool g = getToken(cmd, 2).toInt() != 0;
@@ -487,11 +517,12 @@ void readUdp() {
   int packetSize = udp.parsePacket();
   if (packetSize <= 0) return;
 
+  IPAddress remoteIp = udp.remoteIP();
   int len = udp.read(udpBuffer, sizeof(udpBuffer) - 1);
   if (len <= 0) return;
 
   udpBuffer[len] = '\0';
-  processUdpCommand(String(udpBuffer));
+  processUdpCommand(String(udpBuffer), remoteIp);
 }
 
 void updateGamepad() {
@@ -562,6 +593,8 @@ void setup() {
 
   Serial.print("UDP listener ready on port ");
   Serial.println(UDP_PORT);
+  Serial.print("Controller ID: ");
+  Serial.println(CONTROLLER_ID);
 
   setLifecycleState("starting");
 }

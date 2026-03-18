@@ -41,6 +41,10 @@ DEFAULT_HTTP_PORT = 42069
 DEFAULT_PROFILES_DIR = Path(__file__).resolve().parent.parent / "profiles"
 DEFAULT_FEEDBACK_HOST = "255.255.255.255"
 DEFAULT_FEEDBACK_PORT = 4210
+DEFAULT_DISCOVERY_LISTEN_HOST = "0.0.0.0"
+DEFAULT_DISCOVERY_LISTEN_PORT = 4211
+DEFAULT_DISCOVERY_PROBE_SECONDS = 5.0
+DEFAULT_DISCOVERY_TTL_SECONDS = 30.0
 
 STATE_CODES = {
     "starting": 0,
@@ -107,10 +111,13 @@ def set_http_state(*, payload=None, active_title=_UNSET, profile_path=_UNSET, pr
 
 def get_http_state() -> dict:
     with STATE_LOCK:
-        return {
+        state = {
             "payload": dict(LATEST_PAYLOAD),
             "debug": dict(LATEST_DEBUG),
         }
+    state["debug"]["feedback_targets"] = [f"{host}:{port}" for host, port in FEEDBACK_DISPATCHER.targets]
+    state["debug"]["discovered_controllers"] = FEEDBACK_DISPATCHER.get_known_controllers()
+    return state
 
 
 class ArduinoBridgePublisher:
@@ -153,8 +160,25 @@ BRIDGE_PUBLISHER = ArduinoBridgePublisher()
 
 
 class FeedbackUDPDispatcher:
-    def __init__(self, targets: list[tuple[str, int]]) -> None:
+    def __init__(
+        self,
+        targets: list[tuple[str, int]],
+        *,
+        discovery_listen_host: str = DEFAULT_DISCOVERY_LISTEN_HOST,
+        discovery_listen_port: int = DEFAULT_DISCOVERY_LISTEN_PORT,
+        discovery_probe_seconds: float = DEFAULT_DISCOVERY_PROBE_SECONDS,
+        discovery_ttl_seconds: float = DEFAULT_DISCOVERY_TTL_SECONDS,
+        enable_discovery: bool = True,
+    ) -> None:
         self.targets = [(host, port) for host, port in targets if host and int(port) > 0]
+        self.discovery_listen_host = discovery_listen_host
+        self.discovery_listen_port = int(discovery_listen_port)
+        self.discovery_probe_seconds = float(discovery_probe_seconds)
+        self.discovery_ttl_seconds = float(discovery_ttl_seconds)
+        self.enable_discovery = bool(enable_discovery)
+        self._known_controllers: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+        self._started = False
 
     @classmethod
     def from_env(cls) -> "FeedbackUDPDispatcher":
@@ -186,7 +210,42 @@ class FeedbackUDPDispatcher:
             if host and port > 0:
                 targets.append((host, port))
 
-        return cls(targets)
+        return cls(
+            targets,
+            discovery_listen_host=os.getenv("FEEDBACK_DISCOVERY_HOST", DEFAULT_DISCOVERY_LISTEN_HOST).strip() or DEFAULT_DISCOVERY_LISTEN_HOST,
+            discovery_listen_port=int(os.getenv("FEEDBACK_DISCOVERY_PORT", DEFAULT_DISCOVERY_LISTEN_PORT)),
+            discovery_probe_seconds=float(os.getenv("FEEDBACK_DISCOVERY_PROBE_SECONDS", DEFAULT_DISCOVERY_PROBE_SECONDS)),
+            discovery_ttl_seconds=float(os.getenv("FEEDBACK_DISCOVERY_TTL_SECONDS", DEFAULT_DISCOVERY_TTL_SECONDS)),
+            enable_discovery=os.getenv("FEEDBACK_DISCOVERY_ENABLED", "1").lower() in {"1", "true", "yes", "on"},
+        )
+
+    def start(self) -> None:
+        if self._started or not self.enable_discovery:
+            return
+        self._started = True
+        listener = threading.Thread(target=self._listen_loop, name="feedback-discovery-listener", daemon=True)
+        listener.start()
+        prober = threading.Thread(target=self._probe_loop, name="feedback-discovery-prober", daemon=True)
+        prober.start()
+
+    def get_known_controllers(self) -> list[dict[str, Any]]:
+        now = time.time()
+        with self._lock:
+            self._expire_locked(now)
+            items = []
+            for entry in self._known_controllers.values():
+                age_seconds = max(0.0, now - float(entry.get("last_seen", now)))
+                items.append({
+                    "id": entry.get("id"),
+                    "host": entry.get("host"),
+                    "port": entry.get("port"),
+                    "name": entry.get("name"),
+                    "source": entry.get("source"),
+                    "last_seen": entry.get("last_seen"),
+                    "age_seconds": round(age_seconds, 3),
+                })
+            items.sort(key=lambda item: ((item.get("name") or "").lower(), item.get("host") or "", int(item.get("port") or 0)))
+            return items
 
     def send(self, command: str) -> None:
         command_text = str(command or "").strip()
@@ -201,6 +260,82 @@ class FeedbackUDPDispatcher:
                 dbg(f"Feedback UDP -> {host}:{port} :: {command_text}")
             except Exception as exc:
                 dbg(f"Feedback UDP send failed to {host}:{port} for {command_text!r}: {exc}")
+
+    def _probe_loop(self) -> None:
+        while True:
+            try:
+                self.send("DISCOVER_CONTROLLERS")
+            except Exception as exc:
+                dbg(f"Feedback discovery probe failed: {exc}")
+            time.sleep(max(1.0, self.discovery_probe_seconds))
+
+    def _listen_loop(self) -> None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((self.discovery_listen_host, self.discovery_listen_port))
+                dbg(f"Feedback discovery listening on {self.discovery_listen_host}:{self.discovery_listen_port}")
+                while True:
+                    try:
+                        packet, addr = sock.recvfrom(4096)
+                    except Exception as exc:
+                        dbg(f"Feedback discovery recv failed: {exc}")
+                        continue
+                    self._handle_discovery_packet(packet, addr)
+        except Exception as exc:
+            dbg(f"Feedback discovery listener failed to start: {exc}")
+
+    def _handle_discovery_packet(self, packet: bytes, addr: tuple[str, int]) -> None:
+        try:
+            text = packet.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return
+        if not text:
+            return
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return
+        first = lines[0].upper()
+        if first not in {"HELLO", "HELLO_CONTROLLER", "CONTROLLER_HELLO", "DISCOVER_REPLY", "I_AM_CONTROLLER"} and not first.startswith("HELLO"):
+            return
+
+        metadata: dict[str, str] = {}
+        for line in lines[1:]:
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            metadata[key.strip().lower()] = value.strip()
+
+        host = str(metadata.get("host") or addr[0]).strip() or addr[0]
+        try:
+            port = int(metadata.get("port") or DEFAULT_FEEDBACK_PORT)
+        except ValueError:
+            port = DEFAULT_FEEDBACK_PORT
+        controller_id = str(metadata.get("id") or metadata.get("name") or f"{host}:{port}").strip() or f"{host}:{port}"
+        name = str(metadata.get("name") or metadata.get("id") or controller_id).strip() or controller_id
+        source = lines[0]
+        now = time.time()
+
+        with self._lock:
+            self._known_controllers[controller_id] = {
+                "id": controller_id,
+                "name": name,
+                "host": host,
+                "port": port,
+                "source": source,
+                "last_seen": now,
+            }
+            self._expire_locked(now)
+        dbg(f"Discovered controller {controller_id} at {host}:{port} via {source}")
+
+    def _expire_locked(self, now: float) -> None:
+        stale_ids = [
+            key
+            for key, entry in self._known_controllers.items()
+            if now - float(entry.get("last_seen", 0.0)) > self.discovery_ttl_seconds
+        ]
+        for key in stale_ids:
+            self._known_controllers.pop(key, None)
 
 
 FEEDBACK_DISPATCHER = FeedbackUDPDispatcher.from_env()
@@ -930,10 +1065,6 @@ def normalize_triggers(raw_triggers: Any, fields: dict[str, Any], events: dict[s
             event_names = [str(trigger["send"]).strip()]
         if not event_names:
             raise ProfileValidationError(f"{label} must define event/events/send")
-        for event_name in event_names:
-            if event_name not in events:
-                raise ProfileValidationError(f"{label} references unknown event '{event_name}'")
-
         normalized.append(
             {
                 "name": str(trigger.get("name") or f"trigger_{index + 1}"),
@@ -1162,11 +1293,18 @@ class EventDispatcher:
     def __init__(self, feedback_dispatcher: FeedbackUDPDispatcher) -> None:
         self.feedback_dispatcher = feedback_dispatcher
 
-    def dispatch(self, event_name: str, event_def: dict[str, Any]) -> None:
-        for command in event_def.get("commands", []):
-            self.feedback_dispatcher.send(command.get("command", ""))
+    def dispatch(self, event_name: str, event_def: Optional[dict[str, Any]] = None) -> None:
+        definition = event_def or {"commands": [{"command": event_name}], "actions": []}
+        commands = list(definition.get("commands", []))
+        actions = list(definition.get("actions", []))
 
-        for action in event_def.get("actions", []):
+        if not commands and not actions:
+            commands = [{"command": event_name}]
+
+        for command in commands:
+            self.feedback_dispatcher.send(command.get("command", event_name))
+
+        for action in actions:
             payload = self._serialize_action(event_name, action)
             try:
                 Bridge.call("trigger_event", payload)
@@ -1205,7 +1343,7 @@ class TriggerEngine:
         for trigger in profile.get("triggers", []):
             if evaluate_condition(trigger["when"], current, previous):
                 for event_name in trigger.get("events", []):
-                    event_def = profile["events"][event_name]
+                    event_def = profile.get("events", {}).get(event_name)
                     self.dispatcher.dispatch(event_name, event_def)
         self.previous_snapshot = dict(current)
 
@@ -1242,6 +1380,7 @@ class Runtime:
     def start(self) -> None:
         set_http_state(payload=make_payload(None, "starting", None), profiles_dir=str(self.profiles_dir), profile_path=None, active_title=None, watcher_status="Starting")
         publish_bridge_payload(get_http_state()["payload"])
+        FEEDBACK_DISPATCHER.start()
         start_http_server(self.http_host, self.http_port)
         self.profile, self.active_title = reconnect_and_reload_profile(self.client, self.profiles_dir, self.connect_retry, self.title_retry, self.scaffolded_once)
         self.active_profile_path = self.profiles_dir / f"{slug(self.active_title or '')}.yaml"
