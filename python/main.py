@@ -1159,7 +1159,13 @@ def evaluate_condition(condition: dict[str, Any], current: dict[str, Optional[in
 
 
 class EventDispatcher:
+    def __init__(self, feedback_dispatcher: FeedbackUDPDispatcher) -> None:
+        self.feedback_dispatcher = feedback_dispatcher
+
     def dispatch(self, event_name: str, event_def: dict[str, Any]) -> None:
+        for command in event_def.get("commands", []):
+            self.feedback_dispatcher.send(command.get("command", ""))
+
         for action in event_def.get("actions", []):
             payload = self._serialize_action(event_name, action)
             try:
