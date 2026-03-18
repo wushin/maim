@@ -209,16 +209,26 @@ class FeedbackUDPDispatcher:
         if not command_text:
             return
         payload = (command_text + "\n").encode("utf-8")
-        if target_id and target_id not in {"all", "self"}:
-            target = self._resolve_target(target_id)
+        target_text = str(target_id or "").strip()
+        if target_text and target_text not in {"all", "self"}:
+            target = self._resolve_target(target_text)
             if not target:
-                dbg(f"Feedback target {target_id!r} unavailable for command {command_text!r}")
+                dbg(f"Feedback target {target_text!r} unavailable for command {command_text!r}")
                 return
             self._send_udp(target[0], target[1], payload, command_text)
             return
-        if target_id == "self":
+        if target_text == "self":
             dbg(f"Feedback command reserved for self target: {command_text}")
             return
+        if target_text == "all":
+            controllers = self.get_known_controllers()
+            if controllers:
+                for controller in controllers:
+                    host = str(controller.get("host") or "").strip()
+                    port = int(controller.get("port") or DEFAULT_FEEDBACK_PORT)
+                    if host:
+                        self._send_udp(host, port, payload, command_text)
+                return
         for host, port in self.targets:
             self._send_udp(host, port, payload, command_text)
 
@@ -951,6 +961,42 @@ def normalize_action(action: Any, event_name: str) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_target_value(value: Any, label: str) -> Optional[str]:
+    if value is None:
+        return None
+    target = str(value).strip()
+    if not target:
+        return None
+    return target
+
+
+def normalize_command(command_spec: Any, event_name: str) -> dict[str, Any]:
+    if isinstance(command_spec, str):
+        command_text = command_spec.strip()
+        if not command_text:
+            raise ProfileValidationError(f"event '{event_name}' command must not be empty")
+        return {"command": command_text}
+    if not isinstance(command_spec, dict):
+        raise ProfileValidationError(f"event '{event_name}' command must be a string or mapping")
+
+    command_text = str(command_spec.get("command") or command_spec.get("name") or event_name).strip()
+    if not command_text:
+        raise ProfileValidationError(f"event '{event_name}' command must not be empty")
+
+    normalized: dict[str, Any] = {"command": command_text}
+    target = _normalize_target_value(command_spec.get("target"), f"event '{event_name}' command target")
+    if target is not None:
+        normalized["target"] = target
+
+    raw_targets = command_spec.get("targets")
+    if raw_targets is not None:
+        targets = [_normalize_target_value(item, f"event '{event_name}' command targets") for item in _ensure_list(raw_targets, f"event '{event_name}'.commands.targets")]
+        targets = [item for item in targets if item]
+        if targets:
+            normalized["targets"] = targets
+    return normalized
+
+
 def normalize_events(raw_events: Any) -> dict[str, dict[str, Any]]:
     events = _ensure_mapping(raw_events, "events")
     normalized: dict[str, dict[str, Any]] = {}
@@ -958,20 +1004,64 @@ def normalize_events(raw_events: Any) -> dict[str, dict[str, Any]]:
         name = str(event_name).strip()
         if not name:
             raise ProfileValidationError("event names must not be empty")
+
+        commands_list: list[dict[str, Any]] = []
+        actions_list: list[dict[str, Any]] = []
+
         if isinstance(event_spec, list):
-            event_spec = {"actions": event_spec}
-        elif not isinstance(event_spec, dict):
-            raise ProfileValidationError(f"event '{name}' must be a mapping or action list")
-        actions = event_spec.get("actions")
-        if actions is None and "pin" in event_spec:
-            actions = [event_spec]
-        actions_list = _ensure_list(actions, f"event '{name}'.actions")
-        if not actions_list:
-            raise ProfileValidationError(f"event '{name}' must define at least one action")
+            actions_list = [normalize_action(action, name) for action in event_spec]
+        elif isinstance(event_spec, str):
+            commands_list = [normalize_command(event_spec, name)]
+        elif isinstance(event_spec, dict):
+            actions = event_spec.get("actions")
+            if actions is None and "pin" in event_spec:
+                actions = [event_spec]
+            if actions is not None:
+                actions_list = [normalize_action(action, name) for action in _ensure_list(actions, f"event '{name}'.actions")]
+
+            commands = event_spec.get("commands")
+            if commands is None and any(key in event_spec for key in {"command", "target", "targets"}):
+                commands = [event_spec]
+            if commands is not None:
+                commands_list = [normalize_command(command, name) for command in _ensure_list(commands, f"event '{name}'.commands")]
+        else:
+            raise ProfileValidationError(f"event '{name}' must be a mapping, action list, or command string")
+
+        if not commands_list and not actions_list:
+            commands_list = [{"command": name}]
+
         normalized[name] = {
             "name": name,
-            "actions": [normalize_action(action, name) for action in actions_list],
+            "commands": commands_list,
+            "actions": actions_list,
         }
+    return normalized
+
+
+def normalize_trigger_event_ref(event_ref: Any, label: str) -> dict[str, Any]:
+    if isinstance(event_ref, str):
+        name = event_ref.strip()
+        if not name:
+            raise ProfileValidationError(f"{label} must not be empty")
+        return {"name": name}
+    if not isinstance(event_ref, dict):
+        raise ProfileValidationError(f"{label} must be a string or mapping")
+
+    name = str(event_ref.get("name") or event_ref.get("event") or event_ref.get("send") or "").strip()
+    if not name:
+        raise ProfileValidationError(f"{label} is missing name")
+
+    normalized: dict[str, Any] = {"name": name}
+    target = _normalize_target_value(event_ref.get("target"), f"{label}.target")
+    if target is not None:
+        normalized["target"] = target
+
+    raw_targets = event_ref.get("targets")
+    if raw_targets is not None:
+        targets = [_normalize_target_value(item, f"{label}.targets") for item in _ensure_list(raw_targets, f"{label}.targets")]
+        targets = [item for item in targets if item]
+        if targets:
+            normalized["targets"] = targets
     return normalized
 
 
@@ -994,24 +1084,26 @@ def normalize_triggers(raw_triggers: Any, fields: dict[str, Any], events: dict[s
             }
         condition = normalize_condition(when, fields, label=f"{label}.when")
 
-        event_names: list[str] = []
+        event_refs: list[dict[str, Any]] = []
         if "event" in trigger:
-            event_names = [str(trigger["event"]).strip()]
+            event_refs = [normalize_trigger_event_ref(trigger["event"], f"{label}.event")]
         elif "events" in trigger:
-            event_names = [str(item).strip() for item in _ensure_list(trigger.get("events"), f"{label}.events")]
+            event_refs = [normalize_trigger_event_ref(item, f"{label}.events[{i}]") for i, item in enumerate(_ensure_list(trigger.get("events"), f"{label}.events"))]
         elif "send" in trigger:
-            event_names = [str(trigger["send"]).strip()]
-        if not event_names:
+            event_refs = [normalize_trigger_event_ref(trigger["send"], f"{label}.send")]
+        if not event_refs:
             raise ProfileValidationError(f"{label} must define event/events/send")
-        event_names = [name for name in event_names if name]
-        if not event_names:
-            raise ProfileValidationError(f"{label} must define at least one non-empty event name")
+
+        for event_ref in event_refs:
+            event_name = event_ref["name"]
+            if event_name not in events:
+                dbg(f"{label} references undefined event '{event_name}', using fallback command dispatch")
 
         normalized.append(
             {
                 "name": str(trigger.get("name") or f"trigger_{index + 1}"),
                 "when": condition,
-                "events": event_names,
+                "events": event_refs,
             }
         )
     return normalized
@@ -1235,7 +1327,7 @@ class EventDispatcher:
     def __init__(self, feedback_dispatcher: FeedbackUDPDispatcher) -> None:
         self.feedback_dispatcher = feedback_dispatcher
 
-    def dispatch(self, event_name: str, event_def: Optional[dict[str, Any]] = None) -> None:
+    def dispatch(self, event_name: str, event_def: Optional[dict[str, Any]] = None, target_override: Optional[Any] = None) -> None:
         event_def = event_def or {"name": event_name, "commands": [{"command": event_name}], "actions": []}
         commands = event_def.get("commands", [])
         actions = event_def.get("actions", [])
@@ -1243,21 +1335,69 @@ class EventDispatcher:
         if not commands and not actions:
             commands = [{"command": event_name}]
 
-        for command in commands:
-            if not isinstance(command, dict):
-                continue
-            target_id = None
-            raw_targets = command.get("targets")
-            if isinstance(raw_targets, list) and len(raw_targets) == 1:
-                target_id = str(raw_targets[0]).strip() or None
-            self.feedback_dispatcher.send(str(command.get("command", "")), target_id=target_id)
+        resolved_targets = self._coerce_targets(target_override)
+        if not resolved_targets:
+            for command in commands:
+                if not isinstance(command, dict):
+                    continue
+                command_targets = self._targets_for_command(command)
+                if not command_targets:
+                    self.feedback_dispatcher.send(str(command.get("command", "")))
+                    continue
+                for target_id in command_targets:
+                    self._dispatch_command(str(command.get("command", "")), target_id)
+        else:
+            for command in commands:
+                if not isinstance(command, dict):
+                    continue
+                for target_id in resolved_targets:
+                    self._dispatch_command(str(command.get("command", "")), target_id)
 
-        for action in actions:
-            payload = self._serialize_action(event_name, action)
-            try:
-                Bridge.call("trigger_event", payload)
-            except Exception as exc:
-                dbg(f"Bridge trigger_event failed for {event_name}: {exc}")
+        if resolved_targets == ["self"]:
+            if actions:
+                for action in actions:
+                    payload = self._serialize_action(event_name, action)
+                    self._bridge_trigger(payload, event_name)
+            else:
+                self._bridge_trigger(f"event={event_name}", event_name)
+            return
+
+        if actions:
+            for action in actions:
+                payload = self._serialize_action(event_name, action)
+                self._bridge_trigger(payload, event_name)
+
+    def _dispatch_command(self, command_text: str, target_id: Optional[str]) -> None:
+        command_text = str(command_text or "").strip()
+        if not command_text:
+            return
+        if target_id == "self":
+            self._bridge_trigger(f"event={command_text}", command_text)
+            return
+        self.feedback_dispatcher.send(command_text, target_id=target_id)
+
+    @staticmethod
+    def _coerce_targets(target_value: Optional[Any]) -> list[str]:
+        if target_value is None:
+            return []
+        if isinstance(target_value, list):
+            return [str(item).strip() for item in target_value if str(item).strip()]
+        text = str(target_value).strip()
+        return [text] if text else []
+
+    def _targets_for_command(self, command: dict[str, Any]) -> list[str]:
+        if "targets" in command:
+            return self._coerce_targets(command.get("targets"))
+        if "target" in command:
+            return self._coerce_targets(command.get("target"))
+        return []
+
+    @staticmethod
+    def _bridge_trigger(payload: str, event_name: str) -> None:
+        try:
+            Bridge.call("trigger_event", payload)
+        except Exception as exc:
+            dbg(f"Bridge trigger_event failed for {event_name}: {exc}")
 
     @staticmethod
     def _serialize_action(event_name: str, action: dict[str, Any]) -> str:
@@ -1290,9 +1430,17 @@ class TriggerEngine:
         previous = self.previous_snapshot
         for trigger in profile.get("triggers", []):
             if evaluate_condition(trigger["when"], current, previous):
-                for event_name in trigger.get("events", []):
+                for event_ref in trigger.get("events", []):
+                    if isinstance(event_ref, dict):
+                        event_name = str(event_ref.get("name") or "").strip()
+                        target_override = event_ref.get("targets") if "targets" in event_ref else event_ref.get("target")
+                    else:
+                        event_name = str(event_ref).strip()
+                        target_override = None
+                    if not event_name:
+                        continue
                     event_def = profile.get("events", {}).get(event_name)
-                    self.dispatcher.dispatch(event_name, event_def)
+                    self.dispatcher.dispatch(event_name, event_def, target_override=target_override)
         self.previous_snapshot = dict(current)
 
 
