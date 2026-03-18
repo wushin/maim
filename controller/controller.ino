@@ -2,6 +2,12 @@
 #include <WiFiUdp.h>
 #include <BleGamepad.h>
 
+constexpr bool DEBUG_SERIAL = true;
+
+#define DBG_BEGIN(baud) do { if (DEBUG_SERIAL) Serial.begin(baud); } while (0)
+#define DBG_PRINT(x)    do { if (DEBUG_SERIAL) Serial.print(x); } while (0)
+#define DBG_PRINTLN(x)  do { if (DEBUG_SERIAL) Serial.println(x); } while (0)
+
 BleGamepad bleGamepad("IControlThem p1", "MAIM", 100);
 
 // =========================
@@ -127,6 +133,28 @@ void setMotorOutput(int motorIndex, bool on) {
   digitalWrite(rumblePins[motorIndex], on ? HIGH : LOW);
 }
 
+void logMotorAction(const char* action, int motorIndex, uint16_t a = 0, uint16_t b = 0, uint16_t c = 0) {
+  if (!DEBUG_SERIAL) return;
+  DBG_PRINT("[MOTOR] ");
+  DBG_PRINT(action);
+  DBG_PRINT(" motor=");
+  DBG_PRINT(motorIndex + 1);
+  if (a > 0) {
+    DBG_PRINT(" a=");
+    DBG_PRINT(a);
+  }
+  if (b > 0) {
+    DBG_PRINT(" b=");
+    DBG_PRINT(b);
+  }
+  if (c > 0) {
+    DBG_PRINT(" c=");
+    DBG_PRINTLN(c);
+  } else {
+    DBG_PRINTLN("");
+  }
+}
+
 void refreshMotorOutput(int motorIndex) {
   if (!validMotorIndex(motorIndex)) return;
 
@@ -143,6 +171,7 @@ void refreshMotorOutput(int motorIndex) {
 void stopMotorTimedRumble(int motorIndex) {
   if (!validMotorIndex(motorIndex)) return;
   motors[motorIndex].timedRumbleActive = false;
+  logMotorAction("stop_timed", motorIndex);
   refreshMotorOutput(motorIndex);
 }
 
@@ -150,6 +179,7 @@ void startMotorTimedRumble(int motorIndex, uint16_t durationMs) {
   if (!validMotorIndex(motorIndex)) return;
   motors[motorIndex].timedRumbleActive = true;
   motors[motorIndex].timedRumbleUntilMs = millis() + durationMs;
+  logMotorAction("start_timed", motorIndex, durationMs);
   refreshMotorOutput(motorIndex);
 }
 
@@ -158,6 +188,7 @@ void stopMotorPulse(int motorIndex) {
   motors[motorIndex].pulseActive = false;
   motors[motorIndex].pulseOutputState = false;
   motors[motorIndex].pulseEdgesRemaining = 0;
+  logMotorAction("stop_pulse", motorIndex);
   refreshMotorOutput(motorIndex);
 }
 
@@ -171,6 +202,7 @@ void startMotorPulse(int motorIndex, uint16_t onMs, uint16_t offMs, uint16_t cou
   m.pulseOffMs = offMs;
   m.pulseEdgesRemaining = (count * 2) - 1; // first ON already applied
   m.pulseNextToggleMs = millis() + onMs;
+  logMotorAction("start_pulse", motorIndex, onMs, offMs, count);
   refreshMotorOutput(motorIndex);
 }
 
@@ -183,6 +215,7 @@ void startMotorRepeatingPattern(int motorIndex, uint16_t onMs, uint16_t offMs) {
   m.repeatingOnMs = onMs;
   m.repeatingOffMs = offMs;
   m.repeatingNextToggleMs = millis() + onMs;
+  logMotorAction("start_repeat", motorIndex, onMs, offMs);
   refreshMotorOutput(motorIndex);
 }
 
@@ -190,6 +223,7 @@ void stopMotorRepeatingPattern(int motorIndex) {
   if (!validMotorIndex(motorIndex)) return;
   motors[motorIndex].repeatingPatternActive = false;
   motors[motorIndex].repeatingOutputState = false;
+  logMotorAction("stop_repeat", motorIndex);
   refreshMotorOutput(motorIndex);
 }
 
@@ -205,6 +239,7 @@ void stopMotorAllEffects(int motorIndex) {
   motors[motorIndex].repeatingPatternActive = false;
   motors[motorIndex].repeatingOutputState = false;
 
+  logMotorAction("stop_all_effects", motorIndex);
   refreshMotorOutput(motorIndex);
 }
 
@@ -257,22 +292,24 @@ void rgbOff() {
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  DBG_PRINT("[WIFI] Connecting to SSID: ");
+  DBG_PRINTLN(WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  Serial.print("Connecting to Wi-Fi");
+  DBG_PRINT("Connecting to Wi-Fi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(250);
-    Serial.print(".");
+    DBG_PRINT(".");
   }
-  Serial.println();
-  Serial.print("Wi-Fi connected. IP: ");
-  Serial.println(WiFi.localIP());
+  DBG_PRINTLN("");
+  DBG_PRINT("[WIFI] Connected. IP: ");
+  DBG_PRINTLN(WiFi.localIP());
 }
 
 void ensureWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
 
-  Serial.println("Wi-Fi disconnected, reconnecting...");
+  DBG_PRINTLN("[WIFI] Disconnected, reconnecting...");
   WiFi.disconnect();
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
@@ -282,14 +319,16 @@ void ensureWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Wi-Fi reconnected. IP: ");
-    Serial.println(WiFi.localIP());
+    DBG_PRINT("[WIFI] Reconnected. IP: ");
+    DBG_PRINTLN(WiFi.localIP());
   } else {
-    Serial.println("Wi-Fi reconnect timed out.");
+    DBG_PRINTLN("[WIFI] Reconnect timed out.");
   }
 }
 
 void setLifecycleState(const String& state) {
+  DBG_PRINT("[STATE] lifecycle -> ");
+  DBG_PRINTLN(state);
   lifecycleBlinkEnabled = false;
   lifecycleBlinkState = false;
 
@@ -358,10 +397,10 @@ void sendDiscoveryReply(IPAddress targetIp) {
   udp.write((const uint8_t*)payload.c_str(), payload.length());
   udp.endPacket();
 
-  Serial.print("Discovery reply sent to ");
-  Serial.print(targetIp);
-  Serial.print(":");
-  Serial.println(DISCOVERY_REPLY_PORT);
+  DBG_PRINT("[DISCOVERY] Reply sent to ");
+  DBG_PRINT(targetIp);
+  DBG_PRINT(":");
+  DBG_PRINTLN(DISCOVERY_REPLY_PORT);
 }
 
 bool isDiscoveryProbe(const String& cmd) {
@@ -372,6 +411,8 @@ bool isDiscoveryProbe(const String& cmd) {
 }
 
 void handleNamedEvent(const String& cmd) {
+  DBG_PRINT("[EVENT] Named event: ");
+  DBG_PRINTLN(cmd);
   if (cmd == "HIT_STRONG") {
     for (uint8_t i = 0; i < RUMBLE_COUNT; i++) {
       startMotorTimedRumble(i, 140);
@@ -405,8 +446,10 @@ void processUdpCommand(String cmd, IPAddress remoteIp) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
-  Serial.print("UDP cmd: ");
-  Serial.println(cmd);
+  DBG_PRINT("[UDP] ");
+  DBG_PRINT(remoteIp);
+  DBG_PRINT(" -> ");
+  DBG_PRINTLN(cmd);
 
   if (isDiscoveryProbe(cmd)) {
     sendDiscoveryReply(remoteIp);
@@ -441,6 +484,8 @@ void processUdpCommand(String cmd, IPAddress remoteIp) {
 
     if (validMotorIndex(motorIndex) && ms > 0) {
       startMotorTimedRumble(motorIndex, ms);
+    } else {
+      DBG_PRINTLN("[WARN] Invalid RUMBLE command.");
     }
     return;
   }
@@ -452,6 +497,8 @@ void processUdpCommand(String cmd, IPAddress remoteIp) {
       for (uint8_t i = 0; i < RUMBLE_COUNT; i++) {
         startMotorTimedRumble(i, ms);
       }
+    } else {
+      DBG_PRINTLN("[WARN] Invalid RUMBLE_ALL command.");
     }
     return;
   }
@@ -466,6 +513,8 @@ void processUdpCommand(String cmd, IPAddress remoteIp) {
 
     if (validMotorIndex(motorIndex) && onMs > 0 && count > 0) {
       startMotorPulse(motorIndex, onMs, offMs, count);
+    } else {
+      DBG_PRINTLN("[WARN] Invalid PULSE command.");
     }
     return;
   }
@@ -479,6 +528,8 @@ void processUdpCommand(String cmd, IPAddress remoteIp) {
 
     if (validMotorIndex(motorIndex) && onMs > 0) {
       startMotorRepeatingPattern(motorIndex, onMs, offMs);
+    } else {
+      DBG_PRINTLN("[WARN] Invalid REPEAT command.");
     }
     return;
   }
@@ -490,6 +541,8 @@ void processUdpCommand(String cmd, IPAddress remoteIp) {
 
     if (validMotorIndex(motorIndex)) {
       stopMotorAllEffects(motorIndex);
+    } else {
+      DBG_PRINTLN("[WARN] Invalid STOP command.");
     }
     return;
   }
@@ -508,9 +561,14 @@ void processUdpCommand(String cmd, IPAddress remoteIp) {
     bool g = getToken(cmd, 2).toInt() != 0;
     bool b = getToken(cmd, 3).toInt() != 0;
     lifecycleBlinkEnabled = false;
+    DBG_PRINT("[LED] RGB -> ");
+    DBG_PRINT(r); DBG_PRINT(","); DBG_PRINT(g); DBG_PRINT(","); DBG_PRINTLN(b);
     setRgb(r, g, b);
     return;
   }
+
+  DBG_PRINT("[WARN] Unhandled UDP command: ");
+  DBG_PRINTLN(cmd);
 }
 
 void readUdp() {
@@ -518,6 +576,11 @@ void readUdp() {
   if (packetSize <= 0) return;
 
   IPAddress remoteIp = udp.remoteIP();
+  DBG_PRINT("[UDP] Packet received from ");
+  DBG_PRINT(remoteIp);
+  DBG_PRINT(" size=");
+  DBG_PRINTLN(packetSize);
+
   int len = udp.read(udpBuffer, sizeof(udpBuffer) - 1);
   if (len <= 0) return;
 
@@ -526,7 +589,15 @@ void readUdp() {
 }
 
 void updateGamepad() {
-  if (!bleGamepad.isConnected()) {
+  static bool lastBleConnected = false;
+  const bool bleConnected = bleGamepad.isConnected();
+  if (bleConnected != lastBleConnected) {
+    DBG_PRINT("[BLE] Connected state -> ");
+    DBG_PRINTLN(bleConnected ? "connected" : "disconnected");
+    lastBleConnected = bleConnected;
+  }
+
+  if (!bleConnected) {
     return;
   }
 
@@ -560,7 +631,10 @@ void updateGamepad() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  DBG_BEGIN(115200);
+  delay(200);
+  DBG_PRINTLN("");
+  DBG_PRINTLN("[BOOT] Controller starting...");
 
   pinMode(PIN_UP, INPUT_PULLUP);
   pinMode(PIN_RIGHT, INPUT_PULLUP);
@@ -587,16 +661,20 @@ void setup() {
   cfg.setWhichAxes(true, true, false, false, false, false, false, false);
   cfg.setWhichSpecialButtons(false, false, false, false, false, false, false, false);
   bleGamepad.begin(&cfg);
+  DBG_PRINTLN("[BLE] Gamepad initialized.");
 
   connectWiFi();
   udp.begin(UDP_PORT);
 
-  Serial.print("UDP listener ready on port ");
-  Serial.println(UDP_PORT);
-  Serial.print("Controller ID: ");
-  Serial.println(CONTROLLER_ID);
+  DBG_PRINT("[UDP] Listener ready on port ");
+  DBG_PRINTLN(UDP_PORT);
+  DBG_PRINT("[IDENT] Controller ID: ");
+  DBG_PRINTLN(CONTROLLER_ID);
+  DBG_PRINT("[IDENT] Controller name: ");
+  DBG_PRINTLN(CONTROLLER_NAME);
 
   setLifecycleState("starting");
+  DBG_PRINTLN("[BOOT] Setup complete.");
 }
 
 void loop() {
