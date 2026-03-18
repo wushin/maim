@@ -14,65 +14,35 @@ telemetry:
     p1_good: { addr: 0x0752, type: u8 }
     p1_nice: { addr: 0x0754, type: u8 }
 
-events:
-  hp_down_vibration:
-    actions:
-      - pin: 5
-        behavior: set
-        active: high
-        value: on
-        duration_ms: 180
-
-  hp_up_release:
-    actions:
-      - pin: 5
-        behavior: set
-        active: high
-        value: off
-
-  nice_pulse:
-    actions:
-      - pin: 6
-        behavior: pulse
-        active: high
-        on_ms: 110
-        off_ms: 90
-        count: 2
-
-  miss_pulse:
-    actions:
-      - pin: 6
-        behavior: pulse
-        active: high
-        on_ms: 220
-        off_ms: 120
-        count: 1
-
 triggers:
   - name: p1_hp_down
     when:
       field: p1_hp
       compare: decreased
     events:
-      - hp_down_vibration
+      - name: HIT_STRONG
+        target: p1
 
   - name: p1_hp_up
     when:
       field: p1_hp
       compare: increased
     events:
-      - hp_up_release
+      - name: RELEASE
+        target: p1
 
   - name: p1_nice_incremented
     when:
       field: p1_nice
       compare: increased
     events:
-      - nice_pulse
+      - name: PULSE_DOUBLE_SHORT
+        target: p1
 
   - name: p1_miss_incremented
     when:
       field: p1_miss
       compare: increased
     events:
-      - miss_pulse
+      - name: PULSE_SINGLE_LONG
+        target: p1
