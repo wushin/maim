@@ -41,10 +41,9 @@ DEFAULT_HTTP_PORT = 42069
 DEFAULT_PROFILES_DIR = Path(__file__).resolve().parent.parent / "profiles"
 DEFAULT_FEEDBACK_HOST = "255.255.255.255"
 DEFAULT_FEEDBACK_PORT = 4210
-DEFAULT_DISCOVERY_LISTEN_HOST = "0.0.0.0"
-DEFAULT_DISCOVERY_LISTEN_PORT = 4211
-DEFAULT_DISCOVERY_PROBE_SECONDS = 5.0
-DEFAULT_DISCOVERY_TTL_SECONDS = 30.0
+DEFAULT_DISCOVERY_PORT = 4211
+DEFAULT_DISCOVERY_INTERVAL = 5.0
+DEFAULT_CONTROLLER_STALE_SECONDS = 15.0
 
 STATE_CODES = {
     "starting": 0,
@@ -160,23 +159,12 @@ BRIDGE_PUBLISHER = ArduinoBridgePublisher()
 
 
 class FeedbackUDPDispatcher:
-    def __init__(
-        self,
-        targets: list[tuple[str, int]],
-        *,
-        discovery_listen_host: str = DEFAULT_DISCOVERY_LISTEN_HOST,
-        discovery_listen_port: int = DEFAULT_DISCOVERY_LISTEN_PORT,
-        discovery_probe_seconds: float = DEFAULT_DISCOVERY_PROBE_SECONDS,
-        discovery_ttl_seconds: float = DEFAULT_DISCOVERY_TTL_SECONDS,
-        enable_discovery: bool = True,
-    ) -> None:
-        self.targets = [(host, port) for host, port in targets if host and int(port) > 0]
-        self.discovery_listen_host = discovery_listen_host
-        self.discovery_listen_port = int(discovery_listen_port)
-        self.discovery_probe_seconds = float(discovery_probe_seconds)
-        self.discovery_ttl_seconds = float(discovery_ttl_seconds)
-        self.enable_discovery = bool(enable_discovery)
-        self._known_controllers: dict[str, dict[str, Any]] = {}
+    def __init__(self, targets: list[tuple[str, int]]) -> None:
+        self.targets = [(str(host).strip(), int(port)) for host, port in targets if str(host).strip() and int(port) > 0]
+        self.discovery_port = int(os.getenv("FEEDBACK_DISCOVERY_PORT", DEFAULT_DISCOVERY_PORT))
+        self.discovery_interval = float(os.getenv("FEEDBACK_DISCOVERY_INTERVAL", DEFAULT_DISCOVERY_INTERVAL))
+        self.stale_seconds = float(os.getenv("FEEDBACK_CONTROLLER_STALE_SECONDS", DEFAULT_CONTROLLER_STALE_SECONDS))
+        self._controllers: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._started = False
 
@@ -184,7 +172,6 @@ class FeedbackUDPDispatcher:
     def from_env(cls) -> "FeedbackUDPDispatcher":
         raw_targets = os.getenv("FEEDBACK_UDP_TARGETS", "").strip()
         targets: list[tuple[str, int]] = []
-
         if raw_targets:
             for item in raw_targets.split(","):
                 chunk = item.strip()
@@ -203,139 +190,124 @@ class FeedbackUDPDispatcher:
                     port = int(os.getenv("FEEDBACK_UDP_PORT", DEFAULT_FEEDBACK_PORT))
                 if host and port > 0:
                     targets.append((host, port))
-
         if not targets:
             host = os.getenv("FEEDBACK_UDP_HOST", DEFAULT_FEEDBACK_HOST).strip()
             port = int(os.getenv("FEEDBACK_UDP_PORT", DEFAULT_FEEDBACK_PORT))
             if host and port > 0:
                 targets.append((host, port))
-
-        return cls(
-            targets,
-            discovery_listen_host=os.getenv("FEEDBACK_DISCOVERY_HOST", DEFAULT_DISCOVERY_LISTEN_HOST).strip() or DEFAULT_DISCOVERY_LISTEN_HOST,
-            discovery_listen_port=int(os.getenv("FEEDBACK_DISCOVERY_PORT", DEFAULT_DISCOVERY_LISTEN_PORT)),
-            discovery_probe_seconds=float(os.getenv("FEEDBACK_DISCOVERY_PROBE_SECONDS", DEFAULT_DISCOVERY_PROBE_SECONDS)),
-            discovery_ttl_seconds=float(os.getenv("FEEDBACK_DISCOVERY_TTL_SECONDS", DEFAULT_DISCOVERY_TTL_SECONDS)),
-            enable_discovery=os.getenv("FEEDBACK_DISCOVERY_ENABLED", "1").lower() in {"1", "true", "yes", "on"},
-        )
+        return cls(targets)
 
     def start(self) -> None:
-        if self._started or not self.enable_discovery:
+        if self._started:
             return
         self._started = True
-        listener = threading.Thread(target=self._listen_loop, name="feedback-discovery-listener", daemon=True)
-        listener.start()
-        prober = threading.Thread(target=self._probe_loop, name="feedback-discovery-prober", daemon=True)
-        prober.start()
+        threading.Thread(target=self._discovery_listener_loop, name="feedback-discovery-listener", daemon=True).start()
+        threading.Thread(target=self._discovery_probe_loop, name="feedback-discovery-probe", daemon=True).start()
 
-    def get_known_controllers(self) -> list[dict[str, Any]]:
-        now = time.time()
-        with self._lock:
-            self._expire_locked(now)
-            items = []
-            for entry in self._known_controllers.values():
-                age_seconds = max(0.0, now - float(entry.get("last_seen", now)))
-                items.append({
-                    "id": entry.get("id"),
-                    "host": entry.get("host"),
-                    "port": entry.get("port"),
-                    "name": entry.get("name"),
-                    "source": entry.get("source"),
-                    "last_seen": entry.get("last_seen"),
-                    "age_seconds": round(age_seconds, 3),
-                })
-            items.sort(key=lambda item: ((item.get("name") or "").lower(), item.get("host") or "", int(item.get("port") or 0)))
-            return items
-
-    def send(self, command: str) -> None:
+    def send(self, command: str, target_id: Optional[str] = None) -> None:
         command_text = str(command or "").strip()
         if not command_text:
             return
         payload = (command_text + "\n").encode("utf-8")
+        if target_id and target_id not in {"all", "self"}:
+            target = self._resolve_target(target_id)
+            if not target:
+                dbg(f"Feedback target {target_id!r} unavailable for command {command_text!r}")
+                return
+            self._send_udp(target[0], target[1], payload, command_text)
+            return
+        if target_id == "self":
+            dbg(f"Feedback command reserved for self target: {command_text}")
+            return
         for host, port in self.targets:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                    sock.sendto(payload, (host, port))
-                dbg(f"Feedback UDP -> {host}:{port} :: {command_text}")
-            except Exception as exc:
-                dbg(f"Feedback UDP send failed to {host}:{port} for {command_text!r}: {exc}")
+            self._send_udp(host, port, payload, command_text)
 
-    def _probe_loop(self) -> None:
+    def get_known_controllers(self) -> list[dict[str, Any]]:
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        with self._lock:
+            stale_ids = [cid for cid, entry in self._controllers.items() if now - float(entry.get("last_seen", 0)) > self.stale_seconds]
+            for cid in stale_ids:
+                self._controllers.pop(cid, None)
+            for cid, entry in sorted(self._controllers.items()):
+                last_seen = float(entry.get("last_seen", 0))
+                out.append({
+                    "id": cid,
+                    "name": entry.get("name") or cid,
+                    "host": entry.get("host"),
+                    "port": entry.get("port"),
+                    "last_seen": last_seen,
+                    "age_seconds": round(max(0.0, now - last_seen), 2),
+                })
+        return out
+
+    def _resolve_target(self, target_id: str) -> Optional[tuple[str, int]]:
+        with self._lock:
+            entry = self._controllers.get(str(target_id).strip())
+            if not entry:
+                return None
+            return str(entry.get("host")), int(entry.get("port", DEFAULT_FEEDBACK_PORT))
+
+    def _send_udp(self, host: str, port: int, payload: bytes, command_text: str) -> None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.sendto(payload, (host, port))
+            dbg(f"Feedback UDP -> {host}:{port} :: {command_text}")
+        except Exception as exc:
+            dbg(f"Feedback UDP send failed to {host}:{port} for {command_text!r}: {exc}")
+
+    def _discovery_probe_loop(self) -> None:
         while True:
             try:
-                self.send("DISCOVER_CONTROLLERS")
+                payload = b"DISCOVER_CONTROLLERS\n"
+                for host, port in self.targets:
+                    probe_host = host if host != DEFAULT_FEEDBACK_HOST else "255.255.255.255"
+                    self._send_udp(probe_host, self.discovery_port, payload, "DISCOVER_CONTROLLERS")
             except Exception as exc:
-                dbg(f"Feedback discovery probe failed: {exc}")
-            time.sleep(max(1.0, self.discovery_probe_seconds))
+                dbg(f"Discovery probe failed: {exc}")
+            time.sleep(max(1.0, self.discovery_interval))
 
-    def _listen_loop(self) -> None:
+    def _discovery_listener_loop(self) -> None:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((self.discovery_listen_host, self.discovery_listen_port))
-                dbg(f"Feedback discovery listening on {self.discovery_listen_host}:{self.discovery_listen_port}")
+                sock.bind(("0.0.0.0", self.discovery_port))
                 while True:
-                    try:
-                        packet, addr = sock.recvfrom(4096)
-                    except Exception as exc:
-                        dbg(f"Feedback discovery recv failed: {exc}")
-                        continue
-                    self._handle_discovery_packet(packet, addr)
+                    data, addr = sock.recvfrom(2048)
+                    self._handle_discovery_packet(data.decode("utf-8", errors="replace"), addr[0])
         except Exception as exc:
-            dbg(f"Feedback discovery listener failed to start: {exc}")
+            dbg(f"Discovery listener failed: {exc}")
 
-    def _handle_discovery_packet(self, packet: bytes, addr: tuple[str, int]) -> None:
-        try:
-            text = packet.decode("utf-8", errors="replace").strip()
-        except Exception:
+    def _handle_discovery_packet(self, text: str, source_ip: str) -> None:
+        raw = (text or "").strip()
+        if not raw:
             return
-        if not text:
-            return
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
         if not lines:
             return
-        first = lines[0].upper()
-        if first not in {"HELLO", "HELLO_CONTROLLER", "CONTROLLER_HELLO", "DISCOVER_REPLY", "I_AM_CONTROLLER"} and not first.startswith("HELLO"):
+        head = lines[0].upper()
+        if head not in {"HELLO", "HELLO_CONTROLLER", "CONTROLLER_HELLO", "DISCOVER_REPLY", "I_AM_CONTROLLER"}:
             return
-
-        metadata: dict[str, str] = {}
+        meta: dict[str, str] = {}
         for line in lines[1:]:
             if "=" not in line:
                 continue
-            key, value = line.split("=", 1)
-            metadata[key.strip().lower()] = value.strip()
-
-        host = str(metadata.get("host") or addr[0]).strip() or addr[0]
-        try:
-            port = int(metadata.get("port") or DEFAULT_FEEDBACK_PORT)
-        except ValueError:
-            port = DEFAULT_FEEDBACK_PORT
-        controller_id = str(metadata.get("id") or metadata.get("name") or f"{host}:{port}").strip() or f"{host}:{port}"
-        name = str(metadata.get("name") or metadata.get("id") or controller_id).strip() or controller_id
-        source = lines[0]
-        now = time.time()
-
+            k, v = line.split("=", 1)
+            meta[k.strip().lower()] = v.strip()
+        controller_id = meta.get("id") or meta.get("controller_id")
+        if not controller_id:
+            return
+        entry = {
+            "id": controller_id,
+            "name": meta.get("name") or controller_id,
+            "host": meta.get("host") or source_ip,
+            "port": int(meta.get("port") or DEFAULT_FEEDBACK_PORT),
+            "last_seen": time.time(),
+        }
         with self._lock:
-            self._known_controllers[controller_id] = {
-                "id": controller_id,
-                "name": name,
-                "host": host,
-                "port": port,
-                "source": source,
-                "last_seen": now,
-            }
-            self._expire_locked(now)
-        dbg(f"Discovered controller {controller_id} at {host}:{port} via {source}")
-
-    def _expire_locked(self, now: float) -> None:
-        stale_ids = [
-            key
-            for key, entry in self._known_controllers.items()
-            if now - float(entry.get("last_seen", 0.0)) > self.discovery_ttl_seconds
-        ]
-        for key in stale_ids:
-            self._known_controllers.pop(key, None)
+            self._controllers[controller_id] = entry
+        dbg(f"Discovered controller: {entry}")
 
 
 FEEDBACK_DISPATCHER = FeedbackUDPDispatcher.from_env()
@@ -428,6 +400,11 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: ui-
       <li class=\"state-item\" data-state=\"switching_game\"><div class=\"left\"><span class=\"state-dot\"></span><div class=\"state-text\"><span class=\"state-name\">Switching Game</span><span class=\"state-desc\">Title changed, reloading profile</span></div></div><span class=\"state-badge\">idle</span></li>
       <li class=\"state-item\" data-state=\"playing\"><div class=\"left\"><span class=\"state-dot\"></span><div class=\"state-text\"><span class=\"state-name\">Current Game</span><span class=\"state-desc\">Telemetry active</span></div></div><span class=\"state-badge\">idle</span></li>
     </ul>
+    <div style=\"margin-top:12px;\">
+      <div class=\"label\">Controllers</div>
+      <div id=\"controllerSummary\" class=\"value\" style=\"margin-bottom:8px;\">No controllers discovered.</div>
+      <div class=\"value\"><pre id=\"controllersList\">[]</pre></div>
+    </div>
     <div style=\"margin-top:12px;\"><div class=\"label\">Most Recent JSON</div><div class=\"value\"><pre id=\"latestJson\">{}</pre></div></div>
   </section>
   <section class=\"card\">
@@ -447,7 +424,7 @@ const STATUS_NOTIFICATIONS = {
   unknown: { title: "Unknown State", desc: "The watcher returned a state the UI does not recognize yet." }
 };
 const els = {
-  watcherStatus: document.getElementById("watcherStatus"), currentGame: document.getElementById("currentGame"), activeTitle: document.getElementById("activeTitle"), profilePath: document.getElementById("profilePath"), latestJson: document.getElementById("latestJson"), profileSelect: document.getElementById("profileSelect"), refreshProfiles: document.getElementById("refreshProfiles"), saveProfile: document.getElementById("saveProfile"), profileEditor: document.getElementById("profileEditor"), editorStatus: document.getElementById("editorStatus"), notificationBox: document.getElementById("notificationBox"), notificationTitle: document.getElementById("notificationTitle"), notificationDesc: document.getElementById("notificationDesc"), stateList: document.getElementById("stateList"),
+  watcherStatus: document.getElementById("watcherStatus"), currentGame: document.getElementById("currentGame"), activeTitle: document.getElementById("activeTitle"), profilePath: document.getElementById("profilePath"), latestJson: document.getElementById("latestJson"), controllerSummary: document.getElementById("controllerSummary"), controllersList: document.getElementById("controllersList"), profileSelect: document.getElementById("profileSelect"), refreshProfiles: document.getElementById("refreshProfiles"), saveProfile: document.getElementById("saveProfile"), profileEditor: document.getElementById("profileEditor"), editorStatus: document.getElementById("editorStatus"), notificationBox: document.getElementById("notificationBox"), notificationTitle: document.getElementById("notificationTitle"), notificationDesc: document.getElementById("notificationDesc"), stateList: document.getElementById("stateList"),
 };
 function renderNotification(state) {
   const key = STATUS_NOTIFICATIONS[state] ? state : "unknown";
@@ -478,6 +455,9 @@ async function loadStatus() {
   els.activeTitle.textContent = debug.active_title || "—";
   els.profilePath.textContent = debug.profile_path || "—";
   els.latestJson.textContent = JSON.stringify(payload, null, 2);
+  const controllers = debug.discovered_controllers || [];
+  els.controllerSummary.textContent = controllers.length === 0 ? "No controllers discovered." : `${controllers.length} controller${controllers.length === 1 ? "" : "s"} discovered.`;
+  els.controllersList.textContent = JSON.stringify(controllers, null, 2);
 }
 async function loadProfiles(selectedName) {
   const res = await fetch("/api/profiles", { cache: "no-store" });
@@ -910,27 +890,6 @@ def normalize_condition(condition: Any, fields: dict[str, Any], *, label: str = 
     return normalized
 
 
-def normalize_command_spec(command: Any, event_name: str) -> dict[str, Any]:
-    if isinstance(command, str):
-        command_text = command.strip()
-        if not command_text:
-            raise ProfileValidationError(f"event '{event_name}' command must not be empty")
-        return {"command": command_text}
-
-    if not isinstance(command, dict):
-        raise ProfileValidationError(f"event '{event_name}' command must be a string or mapping")
-
-    command_text = str(command.get("command", command.get("send", command.get("udp", ""))) or "").strip()
-    if not command_text:
-        raise ProfileValidationError(f"event '{event_name}' command mapping is missing command/send/udp")
-
-    normalized = {"command": command_text}
-    if "targets" in command:
-        targets = _ensure_list(command.get("targets"), f"event '{event_name}'.command.targets")
-        normalized["targets"] = [str(item).strip() for item in targets if str(item).strip()]
-    return normalized
-
-
 def normalize_action(action: Any, event_name: str) -> dict[str, Any]:
     if not isinstance(action, dict):
         raise ProfileValidationError(f"event '{event_name}' action must be a mapping")
@@ -995,45 +954,24 @@ def normalize_action(action: Any, event_name: str) -> dict[str, Any]:
 def normalize_events(raw_events: Any) -> dict[str, dict[str, Any]]:
     events = _ensure_mapping(raw_events, "events")
     normalized: dict[str, dict[str, Any]] = {}
-
     for event_name, event_spec in events.items():
         name = str(event_name).strip()
         if not name:
             raise ProfileValidationError("event names must not be empty")
-
-        commands_raw: list[Any] = []
-        actions_raw: list[Any] = []
-
-        if isinstance(event_spec, str):
-            commands_raw = [event_spec]
-        elif isinstance(event_spec, list):
-            actions_raw = event_spec
-        elif isinstance(event_spec, dict):
-            if "actions" in event_spec:
-                actions_raw = _ensure_list(event_spec.get("actions"), f"event '{name}'.actions")
-            elif "pin" in event_spec:
-                actions_raw = [event_spec]
-
-            if "commands" in event_spec:
-                commands_raw.extend(_ensure_list(event_spec.get("commands"), f"event '{name}'.commands"))
-            for key in ("command", "send", "udp"):
-                if key in event_spec:
-                    commands_raw.append(event_spec[key])
-
-            if not commands_raw and not actions_raw:
-                commands_raw = [name]
-        else:
-            raise ProfileValidationError(f"event '{name}' must be a mapping, string, or action list")
-
-        if not commands_raw and not actions_raw:
-            commands_raw = [name]
-
+        if isinstance(event_spec, list):
+            event_spec = {"actions": event_spec}
+        elif not isinstance(event_spec, dict):
+            raise ProfileValidationError(f"event '{name}' must be a mapping or action list")
+        actions = event_spec.get("actions")
+        if actions is None and "pin" in event_spec:
+            actions = [event_spec]
+        actions_list = _ensure_list(actions, f"event '{name}'.actions")
+        if not actions_list:
+            raise ProfileValidationError(f"event '{name}' must define at least one action")
         normalized[name] = {
             "name": name,
-            "commands": [normalize_command_spec(command, name) for command in commands_raw],
-            "actions": [normalize_action(action, name) for action in actions_raw],
+            "actions": [normalize_action(action, name) for action in actions_list],
         }
-
     return normalized
 
 
@@ -1065,6 +1003,10 @@ def normalize_triggers(raw_triggers: Any, fields: dict[str, Any], events: dict[s
             event_names = [str(trigger["send"]).strip()]
         if not event_names:
             raise ProfileValidationError(f"{label} must define event/events/send")
+        event_names = [name for name in event_names if name]
+        if not event_names:
+            raise ProfileValidationError(f"{label} must define at least one non-empty event name")
+
         normalized.append(
             {
                 "name": str(trigger.get("name") or f"trigger_{index + 1}"),
@@ -1294,15 +1236,21 @@ class EventDispatcher:
         self.feedback_dispatcher = feedback_dispatcher
 
     def dispatch(self, event_name: str, event_def: Optional[dict[str, Any]] = None) -> None:
-        definition = event_def or {"commands": [{"command": event_name}], "actions": []}
-        commands = list(definition.get("commands", []))
-        actions = list(definition.get("actions", []))
+        event_def = event_def or {"name": event_name, "commands": [{"command": event_name}], "actions": []}
+        commands = event_def.get("commands", [])
+        actions = event_def.get("actions", [])
 
         if not commands and not actions:
             commands = [{"command": event_name}]
 
         for command in commands:
-            self.feedback_dispatcher.send(command.get("command", event_name))
+            if not isinstance(command, dict):
+                continue
+            target_id = None
+            raw_targets = command.get("targets")
+            if isinstance(raw_targets, list) and len(raw_targets) == 1:
+                target_id = str(raw_targets[0]).strip() or None
+            self.feedback_dispatcher.send(str(command.get("command", "")), target_id=target_id)
 
         for action in actions:
             payload = self._serialize_action(event_name, action)
