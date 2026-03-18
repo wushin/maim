@@ -39,6 +39,8 @@ DEFAULT_TITLE_RETRY = 1.0
 DEFAULT_HTTP_HOST = "0.0.0.0"
 DEFAULT_HTTP_PORT = 42069
 DEFAULT_PROFILES_DIR = Path(__file__).resolve().parent.parent / "profiles"
+DEFAULT_FEEDBACK_HOST = "255.255.255.255"
+DEFAULT_FEEDBACK_PORT = 4210
 
 STATE_CODES = {
     "starting": 0,
@@ -148,6 +150,60 @@ class ArduinoBridgePublisher:
 
 
 BRIDGE_PUBLISHER = ArduinoBridgePublisher()
+
+
+class FeedbackUDPDispatcher:
+    def __init__(self, targets: list[tuple[str, int]]) -> None:
+        self.targets = [(host, port) for host, port in targets if host and int(port) > 0]
+
+    @classmethod
+    def from_env(cls) -> "FeedbackUDPDispatcher":
+        raw_targets = os.getenv("FEEDBACK_UDP_TARGETS", "").strip()
+        targets: list[tuple[str, int]] = []
+
+        if raw_targets:
+            for item in raw_targets.split(","):
+                chunk = item.strip()
+                if not chunk:
+                    continue
+                if ":" in chunk:
+                    host, port_text = chunk.rsplit(":", 1)
+                    try:
+                        port = int(port_text.strip())
+                    except ValueError:
+                        dbg(f"Invalid FEEDBACK_UDP_TARGETS entry ignored: {chunk!r}")
+                        continue
+                    host = host.strip()
+                else:
+                    host = chunk
+                    port = int(os.getenv("FEEDBACK_UDP_PORT", DEFAULT_FEEDBACK_PORT))
+                if host and port > 0:
+                    targets.append((host, port))
+
+        if not targets:
+            host = os.getenv("FEEDBACK_UDP_HOST", DEFAULT_FEEDBACK_HOST).strip()
+            port = int(os.getenv("FEEDBACK_UDP_PORT", DEFAULT_FEEDBACK_PORT))
+            if host and port > 0:
+                targets.append((host, port))
+
+        return cls(targets)
+
+    def send(self, command: str) -> None:
+        command_text = str(command or "").strip()
+        if not command_text:
+            return
+        payload = (command_text + "\n").encode("utf-8")
+        for host, port in self.targets:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                    sock.sendto(payload, (host, port))
+                dbg(f"Feedback UDP -> {host}:{port} :: {command_text}")
+            except Exception as exc:
+                dbg(f"Feedback UDP send failed to {host}:{port} for {command_text!r}: {exc}")
+
+
+FEEDBACK_DISPATCHER = FeedbackUDPDispatcher.from_env()
 
 
 def html_page() -> str:
@@ -719,6 +775,27 @@ def normalize_condition(condition: Any, fields: dict[str, Any], *, label: str = 
     return normalized
 
 
+def normalize_command_spec(command: Any, event_name: str) -> dict[str, Any]:
+    if isinstance(command, str):
+        command_text = command.strip()
+        if not command_text:
+            raise ProfileValidationError(f"event '{event_name}' command must not be empty")
+        return {"command": command_text}
+
+    if not isinstance(command, dict):
+        raise ProfileValidationError(f"event '{event_name}' command must be a string or mapping")
+
+    command_text = str(command.get("command", command.get("send", command.get("udp", ""))) or "").strip()
+    if not command_text:
+        raise ProfileValidationError(f"event '{event_name}' command mapping is missing command/send/udp")
+
+    normalized = {"command": command_text}
+    if "targets" in command:
+        targets = _ensure_list(command.get("targets"), f"event '{event_name}'.command.targets")
+        normalized["targets"] = [str(item).strip() for item in targets if str(item).strip()]
+    return normalized
+
+
 def normalize_action(action: Any, event_name: str) -> dict[str, Any]:
     if not isinstance(action, dict):
         raise ProfileValidationError(f"event '{event_name}' action must be a mapping")
@@ -783,24 +860,45 @@ def normalize_action(action: Any, event_name: str) -> dict[str, Any]:
 def normalize_events(raw_events: Any) -> dict[str, dict[str, Any]]:
     events = _ensure_mapping(raw_events, "events")
     normalized: dict[str, dict[str, Any]] = {}
+
     for event_name, event_spec in events.items():
         name = str(event_name).strip()
         if not name:
             raise ProfileValidationError("event names must not be empty")
-        if isinstance(event_spec, list):
-            event_spec = {"actions": event_spec}
-        elif not isinstance(event_spec, dict):
-            raise ProfileValidationError(f"event '{name}' must be a mapping or action list")
-        actions = event_spec.get("actions")
-        if actions is None and "pin" in event_spec:
-            actions = [event_spec]
-        actions_list = _ensure_list(actions, f"event '{name}'.actions")
-        if not actions_list:
-            raise ProfileValidationError(f"event '{name}' must define at least one action")
+
+        commands_raw: list[Any] = []
+        actions_raw: list[Any] = []
+
+        if isinstance(event_spec, str):
+            commands_raw = [event_spec]
+        elif isinstance(event_spec, list):
+            actions_raw = event_spec
+        elif isinstance(event_spec, dict):
+            if "actions" in event_spec:
+                actions_raw = _ensure_list(event_spec.get("actions"), f"event '{name}'.actions")
+            elif "pin" in event_spec:
+                actions_raw = [event_spec]
+
+            if "commands" in event_spec:
+                commands_raw.extend(_ensure_list(event_spec.get("commands"), f"event '{name}'.commands"))
+            for key in ("command", "send", "udp"):
+                if key in event_spec:
+                    commands_raw.append(event_spec[key])
+
+            if not commands_raw and not actions_raw:
+                commands_raw = [name]
+        else:
+            raise ProfileValidationError(f"event '{name}' must be a mapping, string, or action list")
+
+        if not commands_raw and not actions_raw:
+            commands_raw = [name]
+
         normalized[name] = {
             "name": name,
-            "actions": [normalize_action(action, name) for action in actions_list],
+            "commands": [normalize_command_spec(command, name) for command in commands_raw],
+            "actions": [normalize_action(action, name) for action in actions_raw],
         }
+
     return normalized
 
 
@@ -1091,7 +1189,7 @@ class EventDispatcher:
 class TriggerEngine:
     def __init__(self) -> None:
         self.previous_snapshot: Optional[dict[str, Optional[int]]] = None
-        self.dispatcher = EventDispatcher()
+        self.dispatcher = EventDispatcher(FEEDBACK_DISPATCHER)
 
     def reset(self) -> None:
         self.previous_snapshot = None
