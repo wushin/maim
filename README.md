@@ -5,7 +5,7 @@ This README describes the architecture of the MAIM RetroArch watcher runtime.
 The system is a **distributed game experience machine** composed of:
 
 - `main.py` — watcher / telemetry engine / router / HTTP UI
-- `controller.ino` — ESP32 controller node (BLE + haptics + UDP receiver)
+- `controller.ino` — ESP32 controller node (BLE + haptics + HTTP receiver)
 - `sketch.ino` — UNO console-side effects engine
 - YAML profiles — game-specific telemetry + trigger logic
 
@@ -44,9 +44,8 @@ The watcher:
 - Reads configured telemetry fields from emulator RAM
 - Evaluates trigger conditions
 - Emits lifecycle state to the UNO bridge
-- Sends UDP feedback events
-- Discovers controller nodes dynamically
-- Maintains a live routing registry
+- Sends HTTP feedback events to controllers
+- Maintains a live controller routing registry via HTTP register + heartbeat
 - Serves the HTTP status UI and API
 
 It is the **central orchestration runtime**.
@@ -58,10 +57,11 @@ It is the **central orchestration runtime**.
 Each ESP32 controller:
 
 - Acts as a BLE gamepad
-- Connects to Wi-Fi
-- Listens for UDP events on port `4210`
-- Replies to discovery probes on port `4211`
-- Executes local haptic and LED routines
+- Connects to Wi‑Fi
+- Runs an HTTP server for event delivery
+- Registers itself with the watcher via HTTP
+- Sends periodic HTTP heartbeats
+- Executes local haptic and LED routines when receiving HTTP event commands
 
 Controllers are **receivers/interpreters**.
 
@@ -84,32 +84,33 @@ This is where `target: self` events are routed.
 
 ---
 
-## Discovery and Routing
+## Controller Presence and Routing
 
-### Discovery Registry
+### Controller Registry
 
-The watcher continuously probes the network.
+Controllers actively register themselves with the watcher using HTTP:
 
-Controllers reply like this:
+```
+POST /api/controllers/register
+```
 
-```text
-HELLO_CONTROLLER
-id=p1
-host=<ip>
-port=4210
+They maintain presence using periodic:
+
+```
+POST /api/controllers/heartbeat
 ```
 
 The watcher maintains a routing table conceptually like:
 
 ```text
-routing_table[id] -> (ip, port, metadata, last_seen)
+routing_table[id] -> (host, port, metadata, last_seen)
 ```
 
 This registry is:
 
 - Visible in `/status`
 - Used during event dispatch
-- Updated automatically as controllers appear
+- Updated automatically as controllers heartbeat
 
 No static controller configuration is required.
 
@@ -138,26 +139,30 @@ events:
 
 | target | behavior |
 |--------|----------|
-| `p1` | send only to the latest discovered controller `p1` |
-| `all` | send to all discovered controllers |
+| `p1` | send HTTP event to controller `p1` |
+| `all` | send to all registered controllers |
 | `self` | route to UNO bridge local effects |
-| omitted | fall back to legacy configured UDP targets |
+| omitted | fall back to legacy configured targets |
 
 ---
 
-## Wire Protocol Rule
+## Event Delivery Protocol
 
-UDP payload contains **only the event name**.
+Controller events are delivered via HTTP JSON.
 
 Example:
 
 ```text
-HIT_STRONG
+POST http://<controller-host>:<port>/event
 ```
 
-Targeting is never encoded into packets.
+Body:
 
-Routing is entirely watcher-side.
+```json
+{ "event": "HIT_STRONG" }
+```
+
+Targeting is resolved watcher‑side.
 
 ---
 
@@ -255,7 +260,7 @@ events:
 
 Watcher behavior:
 
-- does **not** send UDP
+- does **not** send controller HTTP event
 - calls the UNO bridge
 - UNO performs the hardware action
 
@@ -266,8 +271,7 @@ Watcher behavior:
 | Port | Purpose |
 |------|---------|
 | `42069` | HTTP UI |
-| `4210` | Controller feedback UDP |
-| `4211` | Discovery |
+| Controller HTTP Port | Event delivery + heartbeat |
 
 ---
 
