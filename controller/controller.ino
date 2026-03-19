@@ -1,5 +1,6 @@
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
 #include <BleGamepad.h>
 
 constexpr bool DEBUG_SERIAL = true;
@@ -15,8 +16,11 @@ BleGamepad bleGamepad("IControlThem p1", "MAIM", 100);
 // =========================
 constexpr char WIFI_SSID[] = "YOUR_WIFI_SSID";
 constexpr char WIFI_PASS[] = "YOUR_WIFI_PASSWORD";
-constexpr uint16_t UDP_PORT = 4210;
-constexpr uint16_t DISCOVERY_REPLY_PORT = 4211;
+constexpr uint16_t HTTP_PORT = 4210;
+constexpr char WATCHER_HOST[] = "192.168.1.199";
+constexpr uint16_t WATCHER_PORT = 42069;
+constexpr unsigned long REGISTER_INTERVAL_MS = 15000UL;
+constexpr unsigned long HEARTBEAT_INTERVAL_MS = 5000UL;
 constexpr char CONTROLLER_ID[] = "p1";   // Change per controller: p1, p2, p3, etc.
 constexpr char CONTROLLER_NAME[] = "IControlThem p1";
 
@@ -71,10 +75,11 @@ int16_t lastY = 0;
 bool lastBtn[BTN_COUNT] = {false};
 
 // =========================
-// UDP
+// HTTP
 // =========================
-WiFiUDP udp;
-char udpBuffer[256];
+WebServer server(HTTP_PORT);
+unsigned long lastRegisterAttemptMs = 0;
+unsigned long lastHeartbeatAttemptMs = 0;
 
 // =========================
 // Per-motor state
@@ -381,33 +386,82 @@ String getToken(const String& input, int index) {
   }
 }
 
-void sendDiscoveryReply(IPAddress targetIp) {
-  String payload = "HELLO_CONTROLLER\n";
-  payload += "id=";
-  payload += CONTROLLER_ID;
-  payload += "\nname=";
-  payload += CONTROLLER_NAME;
-  payload += "\nhost=";
-  payload += WiFi.localIP().toString();
-  payload += "\nport=";
-  payload += String(UDP_PORT);
-  payload += "\nrole=controller\n";
-
-  udp.beginPacket(targetIp, DISCOVERY_REPLY_PORT);
-  udp.write((const uint8_t*)payload.c_str(), payload.length());
-  udp.endPacket();
-
-  DBG_PRINT("[DISCOVERY] Reply sent to ");
-  DBG_PRINT(targetIp);
-  DBG_PRINT(":");
-  DBG_PRINTLN(DISCOVERY_REPLY_PORT);
+String jsonField(const String& body, const String& key) {
+  String needle = String("\"") + key + "\"";
+  int keyPos = body.indexOf(needle);
+  if (keyPos < 0) return "";
+  int colonPos = body.indexOf(':', keyPos + needle.length());
+  if (colonPos < 0) return "";
+  int firstQuote = body.indexOf('"', colonPos + 1);
+  if (firstQuote < 0) return "";
+  int secondQuote = body.indexOf('"', firstQuote + 1);
+  if (secondQuote < 0) return "";
+  return body.substring(firstQuote + 1, secondQuote);
 }
 
-bool isDiscoveryProbe(const String& cmd) {
-  return cmd == "DISCOVER_CONTROLLERS" ||
-         cmd == "DISCOVER" ||
-         cmd == "WHO_IS_OUT_THERE" ||
-         cmd == "WHO_ARE_YOU";
+String buildControllerJson() {
+  String body = "{";
+  body += "\"id\":\"";
+  body += CONTROLLER_ID;
+  body += "\",\"name\":\"";
+  body += CONTROLLER_NAME;
+  body += "\",\"role\":\"controller\",\"host\":\"";
+  body += WiFi.localIP().toString();
+  body += "\",\"port\":";
+  body += String(HTTP_PORT);
+  body += ",\"capabilities\":[\"rumble\",\"rgb\",\"ble_gamepad\"]}";
+  return body;
+}
+
+bool postJsonToWatcher(const char* path, const String& body) {
+  if (WiFi.status() != WL_CONNECTED) {
+    DBG_PRINTLN("[HTTP] Skipping watcher POST because Wi-Fi is disconnected.");
+    return false;
+  }
+
+  HTTPClient http;
+  String url = String("http://") + WATCHER_HOST + ":" + String(WATCHER_PORT) + path;
+  DBG_PRINT("[HTTP] POST ");
+  DBG_PRINTLN(url);
+  DBG_PRINT("[HTTP] Body: ");
+  DBG_PRINTLN(body);
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(body);
+  String response = http.getString();
+  DBG_PRINT("[HTTP] Response code: ");
+  DBG_PRINTLN(code);
+  if (response.length() > 0) {
+    DBG_PRINT("[HTTP] Response body: ");
+    DBG_PRINTLN(response);
+  }
+  http.end();
+  return code >= 200 && code < 300;
+}
+
+void sendRegister() {
+  DBG_PRINTLN("[HTTP] Sending controller registration...");
+  postJsonToWatcher("/api/controllers/register", buildControllerJson());
+}
+
+void sendHeartbeat() {
+  DBG_PRINTLN("[HTTP] Sending controller heartbeat...");
+  postJsonToWatcher("/api/controllers/heartbeat", buildControllerJson());
+}
+
+void maybeSendRegisterHeartbeat() {
+  const unsigned long now = millis();
+
+  if ((long)(now - lastRegisterAttemptMs) >= 0 && (lastRegisterAttemptMs == 0 || now - lastRegisterAttemptMs >= REGISTER_INTERVAL_MS)) {
+    lastRegisterAttemptMs = now;
+    sendRegister();
+  }
+
+  if ((long)(now - lastHeartbeatAttemptMs) >= 0 && (lastHeartbeatAttemptMs == 0 || now - lastHeartbeatAttemptMs >= HEARTBEAT_INTERVAL_MS)) {
+    lastHeartbeatAttemptMs = now;
+    sendHeartbeat();
+  }
 }
 
 void handleNamedEvent(const String& cmd) {
@@ -442,19 +496,14 @@ void handleNamedEvent(const String& cmd) {
   }
 }
 
-void processUdpCommand(String cmd, IPAddress remoteIp) {
+void processCommand(String cmd, const String& sourceTag) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
-  DBG_PRINT("[UDP] ");
-  DBG_PRINT(remoteIp);
-  DBG_PRINT(" -> ");
+  DBG_PRINT("[");
+  DBG_PRINT(sourceTag);
+  DBG_PRINT("] -> ");
   DBG_PRINTLN(cmd);
-
-  if (isDiscoveryProbe(cmd)) {
-    sendDiscoveryReply(remoteIp);
-    return;
-  }
 
   if (cmd == "HIT_STRONG" ||
       cmd == "HIT_LIGHT" ||
@@ -567,25 +616,55 @@ void processUdpCommand(String cmd, IPAddress remoteIp) {
     return;
   }
 
-  DBG_PRINT("[WARN] Unhandled UDP command: ");
+  DBG_PRINT("[WARN] Unhandled command: ");
   DBG_PRINTLN(cmd);
 }
 
-void readUdp() {
-  int packetSize = udp.parsePacket();
-  if (packetSize <= 0) return;
+void handleHttpRoot() {
+  DBG_PRINTLN("[HTTP] GET /");
+  server.send(200, "text/plain", "controller alive\n");
+}
 
-  IPAddress remoteIp = udp.remoteIP();
-  DBG_PRINT("[UDP] Packet received from ");
-  DBG_PRINT(remoteIp);
-  DBG_PRINT(" size=");
-  DBG_PRINTLN(packetSize);
+void handleHttpStatus() {
+  DBG_PRINTLN("[HTTP] GET /status");
+  String body = "{";
+  body += "\"id\":\""; body += CONTROLLER_ID; body += "\",";
+  body += "\"name\":\""; body += CONTROLLER_NAME; body += "\",";
+  body += "\"host\":\""; body += WiFi.localIP().toString(); body += "\",";
+  body += "\"port\":"; body += String(HTTP_PORT); body += ",";
+  body += "\"wifi\":\""; body += (WiFi.status() == WL_CONNECTED ? "connected" : "disconnected"); body += "\"}";
+  server.send(200, "application/json", body);
+}
 
-  int len = udp.read(udpBuffer, sizeof(udpBuffer) - 1);
-  if (len <= 0) return;
+void handleHttpEvent() {
+  String body = server.arg("plain");
+  DBG_PRINT("[HTTP] POST /event body: ");
+  DBG_PRINTLN(body);
 
-  udpBuffer[len] = '\0';
-  processUdpCommand(String(udpBuffer), remoteIp);
+  String cmd = jsonField(body, "event");
+  if (cmd.length() == 0) {
+    cmd = body;
+    cmd.trim();
+  }
+
+  if (cmd.length() == 0) {
+    DBG_PRINTLN("[WARN] /event missing event payload.");
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing event\"}");
+    return;
+  }
+
+  processCommand(cmd, "HTTP");
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleHttpNotFound() {
+  DBG_PRINT("[HTTP] 404 ");
+  DBG_PRINTLN(server.uri());
+  server.send(404, "text/plain", "not found\n");
+}
+
+void updateHttpServer() {
+  server.handleClient();
 }
 
 void updateGamepad() {
@@ -664,14 +743,27 @@ void setup() {
   DBG_PRINTLN("[BLE] Gamepad initialized.");
 
   connectWiFi();
-  udp.begin(UDP_PORT);
 
-  DBG_PRINT("[UDP] Listener ready on port ");
-  DBG_PRINTLN(UDP_PORT);
+  server.on("/", HTTP_GET, handleHttpRoot);
+  server.on("/status", HTTP_GET, handleHttpStatus);
+  server.on("/event", HTTP_POST, handleHttpEvent);
+  server.onNotFound(handleHttpNotFound);
+  server.begin();
+
+  DBG_PRINT("[HTTP] Listener ready on port ");
+  DBG_PRINTLN(HTTP_PORT);
   DBG_PRINT("[IDENT] Controller ID: ");
   DBG_PRINTLN(CONTROLLER_ID);
   DBG_PRINT("[IDENT] Controller name: ");
   DBG_PRINTLN(CONTROLLER_NAME);
+  DBG_PRINT("[WATCHER] Host: ");
+  DBG_PRINT(WATCHER_HOST);
+  DBG_PRINT(":");
+  DBG_PRINTLN(WATCHER_PORT);
+
+  sendRegister();
+  lastRegisterAttemptMs = millis();
+  lastHeartbeatAttemptMs = 0;
 
   setLifecycleState("starting");
   DBG_PRINTLN("[BOOT] Setup complete.");
@@ -680,7 +772,8 @@ void setup() {
 void loop() {
   ensureWiFi();
   updateGamepad();
-  readUdp();
+  updateHttpServer();
+  maybeSendRegisterHeartbeat();
   updateMotors();
   updateLifecycleBlink();
   delay(5);

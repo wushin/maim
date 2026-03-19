@@ -10,6 +10,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional, Tuple
 from urllib.parse import unquote, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import yaml
 
@@ -81,9 +83,17 @@ def scaffold_mark_generated() -> bool:
     return os.getenv("SCAFFOLD_MARK_GENERATED", "").lower() in {"1", "true", "yes", "on"}
 
 
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
 def dbg(msg: str) -> None:
     if debug_enabled():
-        print(f"[debug] {msg}", file=sys.stderr, flush=True)
+        print(f"[debug] {msg}", flush=True)
+
+
+def vdbg(msg: str) -> None:
+    print(f"[verbose] {msg}", flush=True)
 
 
 class ProfileValidationError(ValueError):
@@ -158,64 +168,144 @@ class ArduinoBridgePublisher:
 BRIDGE_PUBLISHER = ArduinoBridgePublisher()
 
 
-class FeedbackUDPDispatcher:
+class FeedbackHTTPDispatcher:
     def __init__(self, targets: list[tuple[str, int]]) -> None:
         self.targets = [(str(host).strip(), int(port)) for host, port in targets if str(host).strip() and int(port) > 0]
-        self.discovery_port = int(os.getenv("FEEDBACK_DISCOVERY_PORT", DEFAULT_DISCOVERY_PORT))
-        self.discovery_interval = float(os.getenv("FEEDBACK_DISCOVERY_INTERVAL", DEFAULT_DISCOVERY_INTERVAL))
         self.stale_seconds = float(os.getenv("FEEDBACK_CONTROLLER_STALE_SECONDS", DEFAULT_CONTROLLER_STALE_SECONDS))
+        self.request_timeout = float(os.getenv("FEEDBACK_HTTP_TIMEOUT", 2.5))
         self._controllers: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._started = False
 
     @classmethod
-    def from_env(cls) -> "FeedbackUDPDispatcher":
-        raw_targets = os.getenv("FEEDBACK_UDP_TARGETS", "").strip()
+    def from_env(cls) -> "FeedbackHTTPDispatcher":
+        raw_targets = os.getenv("FEEDBACK_HTTP_TARGETS", "").strip() or os.getenv("FEEDBACK_UDP_TARGETS", "").strip()
+        default_port = int(os.getenv("FEEDBACK_HTTP_PORT", os.getenv("FEEDBACK_UDP_PORT", DEFAULT_FEEDBACK_PORT)))
+        default_host = os.getenv("FEEDBACK_HTTP_HOST", os.getenv("FEEDBACK_UDP_HOST", DEFAULT_FEEDBACK_HOST)).strip()
         targets: list[tuple[str, int]] = []
         if raw_targets:
-            for item in raw_targets.split(","):
+            for item in raw_targets.split(','):
                 chunk = item.strip()
                 if not chunk:
                     continue
-                if ":" in chunk:
-                    host, port_text = chunk.rsplit(":", 1)
+                if ':' in chunk:
+                    host, port_text = chunk.rsplit(':', 1)
                     try:
                         port = int(port_text.strip())
                     except ValueError:
-                        dbg(f"Invalid FEEDBACK_UDP_TARGETS entry ignored: {chunk!r}")
+                        dbg(f"Invalid FEEDBACK_HTTP_TARGETS entry ignored: {chunk!r}")
                         continue
                     host = host.strip()
                 else:
                     host = chunk
-                    port = int(os.getenv("FEEDBACK_UDP_PORT", DEFAULT_FEEDBACK_PORT))
+                    port = default_port
                 if host and port > 0:
                     targets.append((host, port))
-        if not targets:
-            host = os.getenv("FEEDBACK_UDP_HOST", DEFAULT_FEEDBACK_HOST).strip()
-            port = int(os.getenv("FEEDBACK_UDP_PORT", DEFAULT_FEEDBACK_PORT))
-            if host and port > 0:
-                targets.append((host, port))
+        if not targets and default_host and default_port > 0 and default_host != DEFAULT_FEEDBACK_HOST:
+            targets.append((default_host, default_port))
         return cls(targets)
 
     def start(self) -> None:
         if self._started:
             return
         self._started = True
-        threading.Thread(target=self._discovery_listener_loop, name="feedback-discovery-listener", daemon=True).start()
-        threading.Thread(target=self._discovery_probe_loop, name="feedback-discovery-probe", daemon=True).start()
+        vdbg(f"HTTP controller dispatcher started targets={self.targets} stale_seconds={self.stale_seconds} timeout={self.request_timeout}")
+        threading.Thread(target=self._prune_loop, name="feedback-http-prune", daemon=True).start()
+
+    def register_controller(self, payload: dict[str, Any], source_ip: Optional[str] = None) -> dict[str, Any]:
+        controller_id = str(payload.get("id") or payload.get("controller_id") or "").strip()
+        if not controller_id:
+            raise ValueError("missing controller id")
+        host = str(payload.get("host") or source_ip or "").strip()
+        if not host:
+            raise ValueError("missing controller host")
+        port_raw = payload.get("port") or payload.get("command_port") or os.getenv("CONTROLLER_HTTP_PORT", DEFAULT_FEEDBACK_PORT)
+        try:
+            port = int(port_raw)
+        except Exception as exc:
+            raise ValueError("invalid controller port") from exc
+        if port <= 0:
+            raise ValueError("invalid controller port")
+        now = time.time()
+        entry = {
+            "id": controller_id,
+            "name": str(payload.get("name") or controller_id),
+            "host": host,
+            "port": port,
+            "role": str(payload.get("role") or "controller"),
+            "capabilities": list(payload.get("capabilities") or []),
+            "version": str(payload.get("version") or ""),
+            "last_seen": now,
+            "registered_at": now,
+            "source_ip": source_ip,
+        }
+        with self._lock:
+            previous = self._controllers.get(controller_id)
+            if previous and previous.get("registered_at"):
+                entry["registered_at"] = previous["registered_at"]
+            self._controllers[controller_id] = entry
+        if previous is None:
+            vdbg(f"controller register NEW id={controller_id} host={host} port={port} source={source_ip}")
+        else:
+            vdbg(f"controller register REFRESH id={controller_id} host={host} port={port} source={source_ip}")
+        return self._controller_view(entry)
+
+    def heartbeat_controller(self, payload: dict[str, Any], source_ip: Optional[str] = None) -> dict[str, Any]:
+        controller_id = str(payload.get("id") or payload.get("controller_id") or "").strip()
+        if not controller_id:
+            raise ValueError("missing controller id")
+        now = time.time()
+        with self._lock:
+            entry = self._controllers.get(controller_id)
+            if entry is None:
+                host = str(payload.get("host") or source_ip or "").strip()
+                if not host:
+                    raise ValueError("heartbeat for unknown controller without host")
+                port = int(payload.get("port") or os.getenv("CONTROLLER_HTTP_PORT", DEFAULT_FEEDBACK_PORT))
+                entry = {
+                    "id": controller_id,
+                    "name": str(payload.get("name") or controller_id),
+                    "host": host,
+                    "port": port,
+                    "role": str(payload.get("role") or "controller"),
+                    "capabilities": list(payload.get("capabilities") or []),
+                    "version": str(payload.get("version") or ""),
+                    "registered_at": now,
+                    "source_ip": source_ip,
+                }
+                self._controllers[controller_id] = entry
+                vdbg(f"controller heartbeat AUTO-REGISTER id={controller_id} host={host} port={port} source={source_ip}")
+            if payload.get("host"):
+                entry["host"] = str(payload.get("host")).strip()
+            elif source_ip:
+                entry["host"] = source_ip
+            if payload.get("port"):
+                entry["port"] = int(payload.get("port"))
+            if payload.get("name"):
+                entry["name"] = str(payload.get("name"))
+            if payload.get("capabilities") is not None:
+                entry["capabilities"] = list(payload.get("capabilities") or [])
+            if payload.get("version") is not None:
+                entry["version"] = str(payload.get("version") or "")
+            entry["last_seen"] = now
+            entry["source_ip"] = source_ip
+            view = self._controller_view(entry)
+        vdbg(f"controller heartbeat id={controller_id} age=0 source={source_ip}")
+        return view
 
     def send(self, command: str, target_id: Optional[str] = None) -> None:
         command_text = str(command or "").strip()
         if not command_text:
             return
-        payload = (command_text + "\n").encode("utf-8")
         target_text = str(target_id or "").strip()
+        vdbg(f"controller send command={command_text!r} target={target_text or '<default>'}")
         if target_text and target_text not in {"all", "self"}:
             target = self._resolve_target(target_text)
             if not target:
+                vdbg(f"controller route miss id={target_text} command={command_text!r}")
                 dbg(f"Feedback target {target_text!r} unavailable for command {command_text!r}")
                 return
-            self._send_udp(target[0], target[1], payload, command_text)
+            self._post_event(target[0], target[1], command_text, target_text)
             return
         if target_text == "self":
             dbg(f"Feedback command reserved for self target: {command_text}")
@@ -227,10 +317,10 @@ class FeedbackUDPDispatcher:
                     host = str(controller.get("host") or "").strip()
                     port = int(controller.get("port") or DEFAULT_FEEDBACK_PORT)
                     if host:
-                        self._send_udp(host, port, payload, command_text)
+                        self._post_event(host, port, command_text, str(controller.get("id") or "all"))
                 return
         for host, port in self.targets:
-            self._send_udp(host, port, payload, command_text)
+            self._post_event(host, port, command_text, None)
 
     def get_known_controllers(self) -> list[dict[str, Any]]:
         now = time.time()
@@ -238,18 +328,27 @@ class FeedbackUDPDispatcher:
         with self._lock:
             stale_ids = [cid for cid, entry in self._controllers.items() if now - float(entry.get("last_seen", 0)) > self.stale_seconds]
             for cid in stale_ids:
-                self._controllers.pop(cid, None)
+                stale_entry = self._controllers.pop(cid, None)
+                if stale_entry is not None:
+                    vdbg(f"controller stale remove id={cid} host={stale_entry.get('host')} port={stale_entry.get('port')}")
             for cid, entry in sorted(self._controllers.items()):
-                last_seen = float(entry.get("last_seen", 0))
-                out.append({
-                    "id": cid,
-                    "name": entry.get("name") or cid,
-                    "host": entry.get("host"),
-                    "port": entry.get("port"),
-                    "last_seen": last_seen,
-                    "age_seconds": round(max(0.0, now - last_seen), 2),
-                })
+                out.append(self._controller_view(entry, now=now))
         return out
+
+    def _controller_view(self, entry: dict[str, Any], now: Optional[float] = None) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        last_seen = float(entry.get("last_seen", 0))
+        return {
+            "id": entry.get("id"),
+            "name": entry.get("name") or entry.get("id"),
+            "host": entry.get("host"),
+            "port": entry.get("port"),
+            "role": entry.get("role") or "controller",
+            "capabilities": list(entry.get("capabilities") or []),
+            "version": entry.get("version") or "",
+            "last_seen": last_seen,
+            "age_seconds": round(max(0.0, now - last_seen), 2),
+        }
 
     def _resolve_target(self, target_id: str) -> Optional[tuple[str, int]]:
         with self._lock:
@@ -258,69 +357,36 @@ class FeedbackUDPDispatcher:
                 return None
             return str(entry.get("host")), int(entry.get("port", DEFAULT_FEEDBACK_PORT))
 
-    def _send_udp(self, host: str, port: int, payload: bytes, command_text: str) -> None:
+    def _post_event(self, host: str, port: int, command_text: str, target_id: Optional[str]) -> None:
+        url = f"http://{host}:{port}/event"
+        body = json.dumps({"event": command_text}).encode("utf-8")
+        req = Request(url, data=body, method="POST", headers={"Content-Type": "application/json; charset=utf-8"})
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                sock.sendto(payload, (host, port))
-            dbg(f"Feedback UDP -> {host}:{port} :: {command_text}")
+            vdbg(f"HTTP event POST url={url} target={target_id or '<fallback>'} event={command_text!r}")
+            with urlopen(req, timeout=self.request_timeout) as resp:
+                response_body = resp.read().decode("utf-8", errors="replace")
+                vdbg(f"HTTP event OK url={url} status={getattr(resp, 'status', 'n/a')} body={response_body[:240]!r}")
+        except HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            vdbg(f"HTTP event HTTPError url={url} status={exc.code} body={response_body[:240]!r}")
+            dbg(f"Feedback HTTP send failed to {url} for {command_text!r}: HTTP {exc.code}")
+        except URLError as exc:
+            vdbg(f"HTTP event URLError url={url} error={exc}")
+            dbg(f"Feedback HTTP send failed to {url} for {command_text!r}: {exc}")
         except Exception as exc:
-            dbg(f"Feedback UDP send failed to {host}:{port} for {command_text!r}: {exc}")
+            vdbg(f"HTTP event Exception url={url} error={exc}")
+            dbg(f"Feedback HTTP send failed to {url} for {command_text!r}: {exc}")
 
-    def _discovery_probe_loop(self) -> None:
+    def _prune_loop(self) -> None:
         while True:
             try:
-                payload = b"DISCOVER_CONTROLLERS\n"
-                for host, port in self.targets:
-                    probe_host = host if host != DEFAULT_FEEDBACK_HOST else "255.255.255.255"
-                    self._send_udp(probe_host, self.discovery_port, payload, "DISCOVER_CONTROLLERS")
+                self.get_known_controllers()
             except Exception as exc:
-                dbg(f"Discovery probe failed: {exc}")
-            time.sleep(max(1.0, self.discovery_interval))
-
-    def _discovery_listener_loop(self) -> None:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind(("0.0.0.0", self.discovery_port))
-                while True:
-                    data, addr = sock.recvfrom(2048)
-                    self._handle_discovery_packet(data.decode("utf-8", errors="replace"), addr[0])
-        except Exception as exc:
-            dbg(f"Discovery listener failed: {exc}")
-
-    def _handle_discovery_packet(self, text: str, source_ip: str) -> None:
-        raw = (text or "").strip()
-        if not raw:
-            return
-        lines = [line.strip() for line in raw.splitlines() if line.strip()]
-        if not lines:
-            return
-        head = lines[0].upper()
-        if head not in {"HELLO", "HELLO_CONTROLLER", "CONTROLLER_HELLO", "DISCOVER_REPLY", "I_AM_CONTROLLER"}:
-            return
-        meta: dict[str, str] = {}
-        for line in lines[1:]:
-            if "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            meta[k.strip().lower()] = v.strip()
-        controller_id = meta.get("id") or meta.get("controller_id")
-        if not controller_id:
-            return
-        entry = {
-            "id": controller_id,
-            "name": meta.get("name") or controller_id,
-            "host": meta.get("host") or source_ip,
-            "port": int(meta.get("port") or DEFAULT_FEEDBACK_PORT),
-            "last_seen": time.time(),
-        }
-        with self._lock:
-            self._controllers[controller_id] = entry
-        dbg(f"Discovered controller: {entry}")
+                dbg(f"Controller prune loop failed: {exc}")
+            time.sleep(max(1.0, min(self.stale_seconds / 2.0, 5.0)))
 
 
-FEEDBACK_DISPATCHER = FeedbackUDPDispatcher.from_env()
+FEEDBACK_DISPATCHER = FeedbackHTTPDispatcher.from_env()
 
 
 def html_page() -> str:
@@ -545,6 +611,22 @@ class WatcherHTTPHandler(BaseHTTPRequestHandler):
             return []
         return sorted(p.name for p in pdir.glob("*.yaml"))
 
+    def _read_request_body(self) -> str:
+        content_length = int(self.headers.get("Content-Length", "0") or 0)
+        return self.rfile.read(content_length).decode("utf-8")
+
+    def _read_json_body(self) -> dict[str, Any]:
+        raw = self._read_request_body()
+        if not raw.strip():
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid_json: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("json body must be an object")
+        return payload
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         state = get_http_state()
@@ -575,6 +657,28 @@ class WatcherHTTPHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/api/controllers/register":
+            try:
+                payload = self._read_json_body()
+                controller = FEEDBACK_DISPATCHER.register_controller(payload, source_ip=self.client_address[0])
+                self._send_json({"ok": True, "controller": controller})
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                dbg(f"controller register failed: {exc}")
+                self._send_json({"error": "register_failed"}, status=500)
+            return
+        if path == "/api/controllers/heartbeat":
+            try:
+                payload = self._read_json_body()
+                controller = FEEDBACK_DISPATCHER.heartbeat_controller(payload, source_ip=self.client_address[0])
+                self._send_json({"ok": True, "controller": controller})
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                dbg(f"controller heartbeat failed: {exc}")
+                self._send_json({"error": "heartbeat_failed"}, status=500)
+            return
         if not path.startswith("/api/profile/"):
             self._send_json({"error": "not_found"}, status=404)
             return
@@ -586,8 +690,7 @@ class WatcherHTTPHandler(BaseHTTPRequestHandler):
         if not profile_path.exists():
             self._send_json({"error": "profile_not_found", "profile": name}, status=404)
             return
-        content_length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(content_length).decode("utf-8")
+        raw = self._read_request_body()
         try:
             parsed = yaml.safe_load(raw)
             normalize_profile(parsed)
@@ -609,7 +712,7 @@ def start_http_server(host: str, port: int) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), WatcherHTTPHandler)
     thread = threading.Thread(target=server.serve_forever, name="watcher-http", daemon=True)
     thread.start()
-    print(f"HTTP UI listening on http://{host}:{port}", file=sys.stderr, flush=True)
+    log(f"HTTP UI listening on http://{host}:{port}")
     return server
 
 
@@ -747,11 +850,11 @@ def wait_for_ra(client: RA, retry_seconds: float = DEFAULT_CONNECT_RETRY) -> Non
         try:
             status = client.status()
             set_http_state(watcher_status="Connected to RetroArch")
-            print(f"Connected to RetroArch: {status}", file=sys.stderr, flush=True)
+            log(f"Connected to RetroArch: {status}")
             return
         except Exception as exc:
             set_http_state(watcher_status="Waiting for RetroArch")
-            print(f"Waiting for RetroArch... {exc}", file=sys.stderr, flush=True)
+            log(f"Waiting for RetroArch... {exc}")
             time.sleep(retry_seconds)
 
 
@@ -1248,6 +1351,7 @@ def publish_bridge_payload(payload: dict) -> None:
 
 
 def emit_payload(game_title: Optional[str], state: str, data) -> None:
+    vdbg(f"emit_payload game={game_title!r} state={state} data={data}")
     payload = make_payload(game_title, state, data)
     set_http_state(payload=payload)
     publish_bridge_payload(payload)
@@ -1324,7 +1428,7 @@ def evaluate_condition(condition: dict[str, Any], current: dict[str, Optional[in
 
 
 class EventDispatcher:
-    def __init__(self, feedback_dispatcher: FeedbackUDPDispatcher) -> None:
+    def __init__(self, feedback_dispatcher: FeedbackHTTPDispatcher) -> None:
         self.feedback_dispatcher = feedback_dispatcher
 
     def dispatch(self, event_name: str, event_def: Optional[dict[str, Any]] = None, target_override: Optional[Any] = None) -> None:
@@ -1368,6 +1472,7 @@ class EventDispatcher:
                 self._bridge_trigger(payload, event_name)
 
     def _dispatch_command(self, command_text: str, target_id: Optional[str]) -> None:
+        vdbg(f"dispatch command command={command_text!r} target={target_id}")
         command_text = str(command_text or "").strip()
         if not command_text:
             return
@@ -1440,6 +1545,7 @@ class TriggerEngine:
                     if not event_name:
                         continue
                     event_def = profile.get("events", {}).get(event_name)
+                    vdbg(f"trigger fired name={trigger.get('name')} event={event_name} target_override={target_override}")
                     self.dispatcher.dispatch(event_name, event_def, target_override=target_override)
         self.previous_snapshot = dict(current)
 
@@ -1476,6 +1582,8 @@ class Runtime:
     def start(self) -> None:
         set_http_state(payload=make_payload(None, "starting", None), profiles_dir=str(self.profiles_dir), profile_path=None, active_title=None, watcher_status="Starting")
         publish_bridge_payload(get_http_state()["payload"])
+        log("### MAIN HTTP CONTROLLER BUILD LOADED ###")
+        vdbg(f"runtime start host={self.host} port={self.port} profiles_dir={self.profiles_dir}")
         FEEDBACK_DISPATCHER.start()
         start_http_server(self.http_host, self.http_port)
         self.profile, self.active_title = reconnect_and_reload_profile(self.client, self.profiles_dir, self.connect_retry, self.title_retry, self.scaffolded_once)
@@ -1529,7 +1637,7 @@ class Runtime:
                 emit_payload(self.active_title, "disconnected", None)
                 self.last_state = "disconnected"
             set_http_state(watcher_status="Waiting for RetroArch")
-            print(f"RetroArch connection lost: {exc}", file=sys.stderr, flush=True)
+            log(f"RetroArch connection lost: {exc}")
             self.profile, self.active_title = reconnect_and_reload_profile(self.client, self.profiles_dir, self.connect_retry, self.title_retry, self.scaffolded_once)
             self.active_profile_path = self.profiles_dir / f"{slug(self.active_title or '')}.yaml"
             self._reload_profile_state()
