@@ -1,6 +1,6 @@
 #include <WiFi.h>
-#include <WebServer.h>
-#include <HTTPClient.h>
+#include <WiFiClient.h>
+#include <WiFiServer.h>
 #include <BleGamepad.h>
 
 constexpr bool DEBUG_SERIAL = true;
@@ -17,10 +17,9 @@ BleGamepad bleGamepad("IControlThem p1", "MAIM", 100);
 constexpr char WIFI_SSID[] = "YOUR_WIFI_SSID";
 constexpr char WIFI_PASS[] = "YOUR_WIFI_PASSWORD";
 constexpr uint16_t HTTP_PORT = 4210;
-constexpr char WATCHER_HOST[] = "192.168.1.199";
+constexpr char WATCHER_HOST[] = "WATCHER_HOST";
 constexpr uint16_t WATCHER_PORT = 42069;
-constexpr unsigned long REGISTER_INTERVAL_MS = 15000UL;
-constexpr unsigned long HEARTBEAT_INTERVAL_MS = 5000UL;
+constexpr uint32_t HEARTBEAT_INTERVAL_MS = 5000;
 constexpr char CONTROLLER_ID[] = "p1";   // Change per controller: p1, p2, p3, etc.
 constexpr char CONTROLLER_NAME[] = "IControlThem p1";
 
@@ -77,9 +76,10 @@ bool lastBtn[BTN_COUNT] = {false};
 // =========================
 // HTTP
 // =========================
-WebServer server(HTTP_PORT);
-unsigned long lastRegisterAttemptMs = 0;
-unsigned long lastHeartbeatAttemptMs = 0;
+WiFiServer httpServer(HTTP_PORT);
+char httpBodyBuffer[256];
+unsigned long lastHeartbeatMs = 0;
+bool initialRegisterSent = false;
 
 // =========================
 // Per-motor state
@@ -386,84 +386,6 @@ String getToken(const String& input, int index) {
   }
 }
 
-String jsonField(const String& body, const String& key) {
-  String needle = String("\"") + key + "\"";
-  int keyPos = body.indexOf(needle);
-  if (keyPos < 0) return "";
-  int colonPos = body.indexOf(':', keyPos + needle.length());
-  if (colonPos < 0) return "";
-  int firstQuote = body.indexOf('"', colonPos + 1);
-  if (firstQuote < 0) return "";
-  int secondQuote = body.indexOf('"', firstQuote + 1);
-  if (secondQuote < 0) return "";
-  return body.substring(firstQuote + 1, secondQuote);
-}
-
-String buildControllerJson() {
-  String body = "{";
-  body += "\"id\":\"";
-  body += CONTROLLER_ID;
-  body += "\",\"name\":\"";
-  body += CONTROLLER_NAME;
-  body += "\",\"role\":\"controller\",\"host\":\"";
-  body += WiFi.localIP().toString();
-  body += "\",\"port\":";
-  body += String(HTTP_PORT);
-  body += ",\"capabilities\":[\"rumble\",\"rgb\",\"ble_gamepad\"]}";
-  return body;
-}
-
-bool postJsonToWatcher(const char* path, const String& body) {
-  if (WiFi.status() != WL_CONNECTED) {
-    DBG_PRINTLN("[HTTP] Skipping watcher POST because Wi-Fi is disconnected.");
-    return false;
-  }
-
-  HTTPClient http;
-  String url = String("http://") + WATCHER_HOST + ":" + String(WATCHER_PORT) + path;
-  DBG_PRINT("[HTTP] POST ");
-  DBG_PRINTLN(url);
-  DBG_PRINT("[HTTP] Body: ");
-  DBG_PRINTLN(body);
-
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST(body);
-  String response = http.getString();
-  DBG_PRINT("[HTTP] Response code: ");
-  DBG_PRINTLN(code);
-  if (response.length() > 0) {
-    DBG_PRINT("[HTTP] Response body: ");
-    DBG_PRINTLN(response);
-  }
-  http.end();
-  return code >= 200 && code < 300;
-}
-
-void sendRegister() {
-  DBG_PRINTLN("[HTTP] Sending controller registration...");
-  postJsonToWatcher("/api/controllers/register", buildControllerJson());
-}
-
-void sendHeartbeat() {
-  DBG_PRINTLN("[HTTP] Sending controller heartbeat...");
-  postJsonToWatcher("/api/controllers/heartbeat", buildControllerJson());
-}
-
-void maybeSendRegisterHeartbeat() {
-  const unsigned long now = millis();
-
-  if ((long)(now - lastRegisterAttemptMs) >= 0 && (lastRegisterAttemptMs == 0 || now - lastRegisterAttemptMs >= REGISTER_INTERVAL_MS)) {
-    lastRegisterAttemptMs = now;
-    sendRegister();
-  }
-
-  if ((long)(now - lastHeartbeatAttemptMs) >= 0 && (lastHeartbeatAttemptMs == 0 || now - lastHeartbeatAttemptMs >= HEARTBEAT_INTERVAL_MS)) {
-    lastHeartbeatAttemptMs = now;
-    sendHeartbeat();
-  }
-}
-
 void handleNamedEvent(const String& cmd) {
   DBG_PRINT("[EVENT] Named event: ");
   DBG_PRINTLN(cmd);
@@ -496,7 +418,7 @@ void handleNamedEvent(const String& cmd) {
   }
 }
 
-void processCommand(String cmd, const String& sourceTag) {
+void processCommand(String cmd, const char* sourceTag) {
   cmd.trim();
   if (cmd.length() == 0) return;
 
@@ -525,7 +447,6 @@ void processCommand(String cmd, const String& sourceTag) {
     return;
   }
 
-  // RUMBLE <motor> <ms>
   if (cmd.startsWith("RUMBLE ")) {
     int motorId = getToken(cmd, 1).toInt();
     uint16_t ms = (uint16_t)getToken(cmd, 2).toInt();
@@ -539,7 +460,6 @@ void processCommand(String cmd, const String& sourceTag) {
     return;
   }
 
-  // RUMBLE_ALL <ms>
   if (cmd.startsWith("RUMBLE_ALL ")) {
     uint16_t ms = (uint16_t)getToken(cmd, 1).toInt();
     if (ms > 0) {
@@ -552,7 +472,6 @@ void processCommand(String cmd, const String& sourceTag) {
     return;
   }
 
-  // PULSE <motor> <on_ms> <off_ms> <count>
   if (cmd.startsWith("PULSE ")) {
     int motorId = getToken(cmd, 1).toInt();
     uint16_t onMs = (uint16_t)getToken(cmd, 2).toInt();
@@ -568,7 +487,6 @@ void processCommand(String cmd, const String& sourceTag) {
     return;
   }
 
-  // REPEAT <motor> <on_ms> <off_ms>
   if (cmd.startsWith("REPEAT ")) {
     int motorId = getToken(cmd, 1).toInt();
     uint16_t onMs = (uint16_t)getToken(cmd, 2).toInt();
@@ -583,7 +501,6 @@ void processCommand(String cmd, const String& sourceTag) {
     return;
   }
 
-  // STOP <motor>
   if (cmd.startsWith("STOP ")) {
     int motorId = getToken(cmd, 1).toInt();
     int motorIndex = motorIdToIndex(motorId);
@@ -596,23 +513,20 @@ void processCommand(String cmd, const String& sourceTag) {
     return;
   }
 
-  // STATE <name>
   if (cmd.startsWith("STATE ")) {
-    String state = cmd.substring(6);
-    state.trim();
-    setLifecycleState(state);
+    setLifecycleState(getToken(cmd, 1));
     return;
   }
 
-  // RGB <r> <g> <b>
   if (cmd.startsWith("RGB ")) {
-    bool r = getToken(cmd, 1).toInt() != 0;
-    bool g = getToken(cmd, 2).toInt() != 0;
-    bool b = getToken(cmd, 3).toInt() != 0;
+    int r = getToken(cmd, 1).toInt();
+    int g = getToken(cmd, 2).toInt();
+    int b = getToken(cmd, 3).toInt();
     lifecycleBlinkEnabled = false;
-    DBG_PRINT("[LED] RGB -> ");
-    DBG_PRINT(r); DBG_PRINT(","); DBG_PRINT(g); DBG_PRINT(","); DBG_PRINTLN(b);
-    setRgb(r, g, b);
+    setRgb(r != 0, g != 0, b != 0);
+    DBG_PRINT("[RGB] r="); DBG_PRINT(r);
+    DBG_PRINT(" g="); DBG_PRINT(g);
+    DBG_PRINT(" b="); DBG_PRINTLN(b);
     return;
   }
 
@@ -620,63 +534,217 @@ void processCommand(String cmd, const String& sourceTag) {
   DBG_PRINTLN(cmd);
 }
 
-void handleHttpRoot() {
-  DBG_PRINTLN("[HTTP] GET /");
-  server.send(200, "text/plain", "controller alive\n");
+String buildControllerJson() {
+  String json = "{";
+  json += "\"id\":\"";
+  json += CONTROLLER_ID;
+  json += "\",\"name\":\"";
+  json += CONTROLLER_NAME;
+  json += "\",\"role\":\"controller\"";
+  json += ",\"host\":\"";
+  json += WiFi.localIP().toString();
+  json += "\",\"port\":";
+  json += String(HTTP_PORT);
+  json += "}";
+  return json;
 }
 
-void handleHttpStatus() {
-  DBG_PRINTLN("[HTTP] GET /status");
-  String body = "{";
-  body += "\"id\":\""; body += CONTROLLER_ID; body += "\",";
-  body += "\"name\":\""; body += CONTROLLER_NAME; body += "\",";
-  body += "\"host\":\""; body += WiFi.localIP().toString(); body += "\",";
-  body += "\"port\":"; body += String(HTTP_PORT); body += ",";
-  body += "\"wifi\":\""; body += (WiFi.status() == WL_CONNECTED ? "connected" : "disconnected"); body += "\"}";
-  server.send(200, "application/json", body);
-}
+bool postJsonToWatcher(const char* path, const String& json) {
+  WiFiClient client;
+  DBG_PRINT("[HTTP] POST http://");
+  DBG_PRINT(WATCHER_HOST);
+  DBG_PRINT(":");
+  DBG_PRINT(WATCHER_PORT);
+  DBG_PRINT(path);
+  DBG_PRINT(" body=");
+  DBG_PRINTLN(json);
 
-void handleHttpEvent() {
-  String body = server.arg("plain");
-  DBG_PRINT("[HTTP] POST /event body: ");
-  DBG_PRINTLN(body);
-
-  String cmd = jsonField(body, "event");
-  if (cmd.length() == 0) {
-    cmd = body;
-    cmd.trim();
+  if (!client.connect(WATCHER_HOST, WATCHER_PORT)) {
+    DBG_PRINTLN("[HTTP] connect failed");
+    return false;
   }
 
-  if (cmd.length() == 0) {
-    DBG_PRINTLN("[WARN] /event missing event payload.");
-    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing event\"}");
+  client.print("POST ");
+  client.print(path);
+  client.print(" HTTP/1.1\r\nHost: ");
+  client.print(WATCHER_HOST);
+  client.print(":");
+  client.print(WATCHER_PORT);
+  client.print("\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ");
+  client.print(json.length());
+  client.print("\r\n\r\n");
+  client.print(json);
+
+  unsigned long deadline = millis() + 3000;
+  while (!client.available() && client.connected() && (long)(millis() - deadline) < 0) {
+    delay(5);
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+  DBG_PRINT("[HTTP] response ");
+  DBG_PRINTLN(statusLine);
+
+  while (client.connected() || client.available()) {
+    while (client.available()) {
+      client.read();
+    }
+    delay(1);
+  }
+  client.stop();
+  return statusLine.indexOf(" 200 ") >= 0 || statusLine.indexOf(" 201 ") >= 0 || statusLine.indexOf(" 204 ") >= 0;
+}
+
+void sendRegister() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  const bool ok = postJsonToWatcher("/api/controllers/register", buildControllerJson());
+  DBG_PRINT("[REGISTER] ");
+  DBG_PRINTLN(ok ? "ok" : "failed");
+  if (ok) initialRegisterSent = true;
+}
+
+void sendHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  const bool ok = postJsonToWatcher("/api/controllers/heartbeat", buildControllerJson());
+  DBG_PRINT("[HEARTBEAT] ");
+  DBG_PRINTLN(ok ? "ok" : "failed");
+}
+
+void maybeSendHeartbeat() {
+  const unsigned long now = millis();
+
+  if (!initialRegisterSent) {
+    sendRegister();
+    lastHeartbeatMs = now;
     return;
   }
 
-  processCommand(cmd, "HTTP");
-  server.send(200, "application/json", "{\"ok\":true}");
+  if ((unsigned long)(now - lastHeartbeatMs) >= HEARTBEAT_INTERVAL_MS) {
+    sendHeartbeat();
+    lastHeartbeatMs = now;
+  }
 }
 
-void handleHttpNotFound() {
-  DBG_PRINT("[HTTP] 404 ");
-  DBG_PRINTLN(server.uri());
-  server.send(404, "text/plain", "not found\n");
+void sendHttpResponse(WiFiClient& client, int code, const char* contentType, const String& body) {
+  client.print("HTTP/1.1 ");
+  client.print(code);
+  switch (code) {
+    case 200: client.print(" OK"); break;
+    case 400: client.print(" Bad Request"); break;
+    case 404: client.print(" Not Found"); break;
+    case 405: client.print(" Method Not Allowed"); break;
+    default:  client.print(" OK"); break;
+  }
+  client.print("\r\nContent-Type: ");
+  client.print(contentType);
+  client.print("\r\nConnection: close\r\nContent-Length: ");
+  client.print(body.length());
+  client.print("\r\n\r\n");
+  client.print(body);
 }
 
-void updateHttpServer() {
-  server.handleClient();
+void readHttp() {
+  WiFiClient client = httpServer.available();
+  if (!client) return;
+
+  client.setTimeout(50);
+  String requestLine = client.readStringUntil('\n');
+  requestLine.trim();
+  if (requestLine.length() == 0) {
+    client.stop();
+    return;
+  }
+
+  DBG_PRINT("[HTTP] request ");
+  DBG_PRINTLN(requestLine);
+
+  int firstSpace = requestLine.indexOf(' ');
+  int secondSpace = requestLine.indexOf(' ', firstSpace + 1);
+  if (firstSpace <= 0 || secondSpace <= firstSpace) {
+    sendHttpResponse(client, 400, "text/plain", "bad request\n");
+    client.stop();
+    return;
+  }
+
+  String method = requestLine.substring(0, firstSpace);
+  String path = requestLine.substring(firstSpace + 1, secondSpace);
+  int contentLength = 0;
+
+  while (client.connected()) {
+    String headerLine = client.readStringUntil('\n');
+    headerLine.trim();
+    if (headerLine.length() == 0) break;
+
+    if (headerLine.startsWith("Content-Length:")) {
+      contentLength = headerLine.substring(15).toInt();
+    }
+  }
+
+  String body = "";
+  if (contentLength > 0) {
+    const int maxLen = (int)sizeof(httpBodyBuffer) - 1;
+    int want = contentLength > maxLen ? maxLen : contentLength;
+    int got = 0;
+    unsigned long deadline = millis() + 1000;
+    while (got < want && (long)(millis() - deadline) < 0) {
+      while (client.available() && got < want) {
+        httpBodyBuffer[got++] = (char)client.read();
+      }
+      if (got >= want) break;
+      delay(1);
+    }
+    httpBodyBuffer[got] = '\0';
+    body = String(httpBodyBuffer);
+  }
+
+  if (method == "GET" && path == "/") {
+    sendHttpResponse(client, 200, "text/plain", "controller ok\n");
+    client.stop();
+    return;
+  }
+
+  if (method == "GET" && path == "/status") {
+    sendHttpResponse(client, 200, "application/json", buildControllerJson());
+    client.stop();
+    return;
+  }
+
+  if (method == "POST" && path == "/event") {
+    DBG_PRINT("[HTTP] /event body=");
+    DBG_PRINTLN(body);
+
+    String eventValue = body;
+    int keyPos = body.indexOf("\"event\"");
+    if (keyPos >= 0) {
+      int colonPos = body.indexOf(':', keyPos);
+      int q1 = body.indexOf('"', colonPos + 1);
+      int q2 = body.indexOf('"', q1 + 1);
+      if (colonPos >= 0 && q1 >= 0 && q2 > q1) {
+        eventValue = body.substring(q1 + 1, q2);
+      }
+    }
+
+    eventValue.trim();
+    processCommand(eventValue, "HTTP");
+    sendHttpResponse(client, 200, "application/json", "{\"ok\":true}\n");
+    client.stop();
+    return;
+  }
+
+  if (path == "/event") {
+    sendHttpResponse(client, 405, "text/plain", "method not allowed\n");
+    client.stop();
+    return;
+  }
+
+  DBG_PRINT("[HTTP] 404 path=");
+  DBG_PRINTLN(path);
+  sendHttpResponse(client, 404, "text/plain", "not found\n");
+  client.stop();
 }
 
 void updateGamepad() {
-  static bool lastBleConnected = false;
-  const bool bleConnected = bleGamepad.isConnected();
-  if (bleConnected != lastBleConnected) {
-    DBG_PRINT("[BLE] Connected state -> ");
-    DBG_PRINTLN(bleConnected ? "connected" : "disconnected");
-    lastBleConnected = bleConnected;
-  }
-
-  if (!bleConnected) {
+  if (!bleGamepad.isConnected()) {
     return;
   }
 
@@ -711,9 +779,6 @@ void updateGamepad() {
 
 void setup() {
   DBG_BEGIN(115200);
-  delay(200);
-  DBG_PRINTLN("");
-  DBG_PRINTLN("[BOOT] Controller starting...");
 
   pinMode(PIN_UP, INPUT_PULLUP);
   pinMode(PIN_RIGHT, INPUT_PULLUP);
@@ -740,40 +805,32 @@ void setup() {
   cfg.setWhichAxes(true, true, false, false, false, false, false, false);
   cfg.setWhichSpecialButtons(false, false, false, false, false, false, false, false);
   bleGamepad.begin(&cfg);
-  DBG_PRINTLN("[BLE] Gamepad initialized.");
 
   connectWiFi();
+  httpServer.begin();
 
-  server.on("/", HTTP_GET, handleHttpRoot);
-  server.on("/status", HTTP_GET, handleHttpStatus);
-  server.on("/event", HTTP_POST, handleHttpEvent);
-  server.onNotFound(handleHttpNotFound);
-  server.begin();
-
-  DBG_PRINT("[HTTP] Listener ready on port ");
+  DBG_PRINT("HTTP listener ready on port ");
   DBG_PRINTLN(HTTP_PORT);
-  DBG_PRINT("[IDENT] Controller ID: ");
+  DBG_PRINT("Controller ID: ");
   DBG_PRINTLN(CONTROLLER_ID);
-  DBG_PRINT("[IDENT] Controller name: ");
-  DBG_PRINTLN(CONTROLLER_NAME);
-  DBG_PRINT("[WATCHER] Host: ");
+  DBG_PRINT("Watcher: ");
   DBG_PRINT(WATCHER_HOST);
   DBG_PRINT(":");
   DBG_PRINTLN(WATCHER_PORT);
 
-  sendRegister();
-  lastRegisterAttemptMs = millis();
-  lastHeartbeatAttemptMs = 0;
-
   setLifecycleState("starting");
-  DBG_PRINTLN("[BOOT] Setup complete.");
+  sendRegister();
+  lastHeartbeatMs = millis();
 }
 
 void loop() {
   ensureWiFi();
+  if (WiFi.status() == WL_CONNECTED && !initialRegisterSent) {
+    sendRegister();
+  }
   updateGamepad();
-  updateHttpServer();
-  maybeSendRegisterHeartbeat();
+  readHttp();
+  maybeSendHeartbeat();
   updateMotors();
   updateLifecycleBlink();
   delay(5);
