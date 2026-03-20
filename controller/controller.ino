@@ -24,7 +24,7 @@ constexpr char CONTROLLER_ID[] = "p1";   // Change per controller: p1, p2, p3, e
 constexpr char CONTROLLER_NAME[] = "IControlThem p1";
 
 // =========================
-// D-pad pins (digital -> X/Y axes)
+// D-pad pins (digital -> BLE hat switch)
 // =========================
 constexpr uint8_t PIN_UP    = 16;
 constexpr uint8_t PIN_RIGHT = 17;
@@ -34,6 +34,7 @@ constexpr uint8_t PIN_LEFT  = 19;
 // =========================
 // Buttons in this exact order become BUTTON_1..BUTTON_8
 // 1=B, 2=A, 3=Y, 4=X, 5=L, 6=R, 7=Select, 8=Start
+// D-pad uses the BLE hat switch report
 // =========================
 constexpr uint8_t BTN_COUNT = 8;
 constexpr uint8_t btnPins[BTN_COUNT] = {
@@ -70,8 +71,7 @@ constexpr uint8_t PIN_LED_B = PIN_STATUS_LED;
 // =========================
 // BLE state tracking
 // =========================
-int16_t lastX = 0;
-int16_t lastY = 0;
+uint8_t lastHat = DPAD_CENTERED;
 bool lastBtn[BTN_COUNT] = {false};
 
 // =========================
@@ -129,12 +129,6 @@ static inline bool pressed(uint8_t pin) {
   return digitalRead(pin) == LOW;
 }
 
-static int16_t axisFromPair(bool negative, bool positive) {
-  if (negative && positive) return 0;
-  if (negative) return -32767;
-  if (positive) return 32767;
-  return 0;
-}
 
 bool validMotorIndex(int motorIndex) {
   return motorIndex >= 0 && motorIndex < (int)RUMBLE_COUNT;
@@ -820,17 +814,20 @@ void updateGamepad() {
   const bool down  = pressed(PIN_DOWN);
   const bool left  = pressed(PIN_LEFT);
 
-  const int16_t x = axisFromPair(left, right);
-  const int16_t y = axisFromPair(up, down);
+  uint8_t hat = DPAD_CENTERED;
 
-  if (x != lastX) {
-    bleGamepad.setX(x);
-    lastX = x;
-  }
+  if (up && right)      hat = DPAD_UP_RIGHT;
+  else if (right && down) hat = DPAD_DOWN_RIGHT;
+  else if (down && left)  hat = DPAD_DOWN_LEFT;
+  else if (left && up)    hat = DPAD_UP_LEFT;
+  else if (up)           hat = DPAD_UP;
+  else if (right)        hat = DPAD_RIGHT;
+  else if (down)         hat = DPAD_DOWN;
+  else if (left)         hat = DPAD_LEFT;
 
-  if (y != lastY) {
-    bleGamepad.setY(y);
-    lastY = y;
+  if (hat != lastHat) {
+    bleGamepad.setHat1(hat);
+    lastHat = hat;
   }
 
   for (uint8_t i = 0; i < BTN_COUNT; i++) {
@@ -868,8 +865,8 @@ void setup() {
 
   BleGamepadConfiguration cfg;
   cfg.setButtonCount(BTN_COUNT);
-  cfg.setHatSwitchCount(0);
-  cfg.setWhichAxes(true, true, false, false, false, false, false, false);
+  cfg.setHatSwitchCount(1);
+  cfg.setWhichAxes(false, false, false, false, false, false, false, false);
   cfg.setWhichSpecialButtons(false, false, false, false, false, false, false, false);
   bleGamepad.begin(&cfg);
 
