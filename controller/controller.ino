@@ -14,10 +14,10 @@ BleGamepad bleGamepad("IControlThem p1", "MAIM", 100);
 // =========================
 // Wi-Fi settings
 // =========================
-constexpr char WIFI_SSID[] = "YOUR_WIFI_SSID";
-constexpr char WIFI_PASS[] = "YOUR_WIFI_PASSWORD";
+constexpr char WIFI_SSID[] = "ThisWifiMakesYouGay";
+constexpr char WIFI_PASS[] = "SylviaRivera";
 constexpr uint16_t HTTP_PORT = 4210;
-constexpr char WATCHER_HOST[] = "WATCHER_HOST";
+constexpr char WATCHER_HOST[] = "192.168.1.199";
 constexpr uint16_t WATCHER_PORT = 42069;
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 5000;
 constexpr char CONTROLLER_ID[] = "p1";   // Change per controller: p1, p2, p3, etc.
@@ -59,12 +59,13 @@ constexpr uint8_t rumblePins[RUMBLE_COUNT] = {
 };
 
 // =========================
-// RGB LED pins
-// Change as needed for your wiring
+// Single controllable onboard blue LED
+// ESP32-WROOM dev boards commonly expose this on GPIO 2
 // =========================
-constexpr uint8_t PIN_LED_R = 4;
-constexpr uint8_t PIN_LED_G = 5;
-constexpr uint8_t PIN_LED_B = 12;
+constexpr uint8_t PIN_STATUS_LED = 2;
+constexpr uint8_t PIN_LED_R = PIN_STATUS_LED;
+constexpr uint8_t PIN_LED_G = PIN_STATUS_LED;
+constexpr uint8_t PIN_LED_B = PIN_STATUS_LED;
 
 // =========================
 // BLE state tracking
@@ -105,11 +106,21 @@ struct MotorState {
 MotorState motors[RUMBLE_COUNT];
 
 // =========================
-// Lifecycle LED blink state
+// Single blue LED state
 // =========================
-bool lifecycleBlinkEnabled = false;
-unsigned long lifecycleBlinkNextMs = 0;
-bool lifecycleBlinkState = false;
+enum LedMode : uint8_t {
+  LED_MODE_OFF = 0,
+  LED_MODE_ON = 1,
+  LED_MODE_BLINK = 2,
+  LED_MODE_PULSE = 3,
+};
+
+LedMode ledMode = LED_MODE_ON;
+bool ledOutputState = true;
+unsigned long ledNextToggleMs = 0;
+uint16_t ledBlinkOnMs = 700;
+uint16_t ledBlinkOffMs = 700;
+uint16_t ledPulseMs = 80;
 
 // =========================
 // Helpers
@@ -284,14 +295,61 @@ void updateMotors() {
   }
 }
 
+void setStatusLed(bool on) {
+  digitalWrite(PIN_STATUS_LED, on ? HIGH : LOW);
+  ledOutputState = on;
+}
+
 void setRgb(bool r, bool g, bool b) {
-  digitalWrite(PIN_LED_R, r ? HIGH : LOW);
-  digitalWrite(PIN_LED_G, g ? HIGH : LOW);
-  digitalWrite(PIN_LED_B, b ? HIGH : LOW);
+  setStatusLed(r || g || b);
 }
 
 void rgbOff() {
-  setRgb(false, false, false);
+  setStatusLed(false);
+}
+
+void setLedOff() {
+  ledMode = LED_MODE_OFF;
+  setStatusLed(false);
+}
+
+void setLedOn() {
+  ledMode = LED_MODE_ON;
+  setStatusLed(true);
+}
+
+void startLedBlink(uint16_t onMs, uint16_t offMs) {
+  if (onMs == 0) onMs = 700;
+  if (offMs == 0) offMs = onMs;
+  ledMode = LED_MODE_BLINK;
+  ledBlinkOnMs = onMs;
+  ledBlinkOffMs = offMs;
+  setStatusLed(true);
+  ledNextToggleMs = millis() + ledBlinkOnMs;
+}
+
+void startLedPulse(uint16_t pulseMs) {
+  if (pulseMs == 0) pulseMs = 80;
+  ledMode = LED_MODE_PULSE;
+  ledPulseMs = pulseMs;
+  setStatusLed(true);
+  ledNextToggleMs = millis() + ledPulseMs;
+}
+
+void updateStatusLed() {
+  if ((long)(millis() - ledNextToggleMs) < 0) return;
+
+  if (ledMode == LED_MODE_BLINK) {
+    const bool nextState = !ledOutputState;
+    setStatusLed(nextState);
+    ledNextToggleMs = millis() + (nextState ? ledBlinkOnMs : ledBlinkOffMs);
+    return;
+  }
+
+  if (ledMode == LED_MODE_PULSE) {
+    setLedOff();
+    return;
+  }
 }
 
 void connectWiFi() {
@@ -334,34 +392,24 @@ void ensureWiFi() {
 void setLifecycleState(const String& state) {
   DBG_PRINT("[STATE] lifecycle -> ");
   DBG_PRINTLN(state);
-  lifecycleBlinkEnabled = false;
-  lifecycleBlinkState = false;
 
   if (state == "starting") {
-    setRgb(false, false, true);
+    setLedOn();
   } else if (state == "disconnected") {
-    setRgb(true, false, false);
-    lifecycleBlinkEnabled = true;
-    lifecycleBlinkNextMs = millis() + 300;
-    lifecycleBlinkState = true;
+    setLedOff();
   } else if (state == "waiting_content") {
-    setRgb(true, true, false);
+    startLedBlink(700, 700);
   } else if (state == "switching_game") {
-    setRgb(true, false, true);
+    startLedPulse(80);
   } else if (state == "playing") {
-    setRgb(false, true, false);
+    startLedPulse(80);
   } else {
-    rgbOff();
+    setLedOff();
   }
 }
 
 void updateLifecycleBlink() {
-  if (!lifecycleBlinkEnabled) return;
-  if ((long)(millis() - lifecycleBlinkNextMs) < 0) return;
-
-  lifecycleBlinkState = !lifecycleBlinkState;
-  setRgb(lifecycleBlinkState, false, false);
-  lifecycleBlinkNextMs = millis() + 300;
+  updateStatusLed();
 }
 
 String getToken(const String& input, int index) {
@@ -442,8 +490,28 @@ void processCommand(String cmd, const char* sourceTag) {
   }
 
   if (cmd == "LED OFF") {
-    lifecycleBlinkEnabled = false;
-    rgbOff();
+    setLedOff();
+    return;
+  }
+
+  if (cmd == "LED ON") {
+    setLedOn();
+    return;
+  }
+
+  if (cmd.startsWith("LED BLINK ")) {
+    uint16_t onMs = (uint16_t)getToken(cmd, 2).toInt();
+    uint16_t offMs = (uint16_t)getToken(cmd, 3).toInt();
+    startLedBlink(onMs, offMs);
+    DBG_PRINT("[LED] blink on="); DBG_PRINT(onMs);
+    DBG_PRINT(" off="); DBG_PRINTLN(offMs);
+    return;
+  }
+
+  if (cmd.startsWith("LED PULSE ")) {
+    uint16_t pulseMs = (uint16_t)getToken(cmd, 2).toInt();
+    startLedPulse(pulseMs);
+    DBG_PRINT("[LED] pulse ms="); DBG_PRINTLN(pulseMs);
     return;
   }
 
@@ -522,7 +590,6 @@ void processCommand(String cmd, const char* sourceTag) {
     int r = getToken(cmd, 1).toInt();
     int g = getToken(cmd, 2).toInt();
     int b = getToken(cmd, 3).toInt();
-    lifecycleBlinkEnabled = false;
     setRgb(r != 0, g != 0, b != 0);
     DBG_PRINT("[RGB] r="); DBG_PRINT(r);
     DBG_PRINT(" g="); DBG_PRINT(g);
@@ -647,7 +714,7 @@ void readHttp() {
   WiFiClient client = httpServer.available();
   if (!client) return;
 
-  client.setTimeout(50);
+  client.setTimeout(1000);
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
   if (requestLine.length() == 0) {

@@ -325,14 +325,18 @@ class FeedbackHTTPDispatcher:
     def get_known_controllers(self) -> list[dict[str, Any]]:
         now = time.time()
         out: list[dict[str, Any]] = []
+        removed: list[str] = []
         with self._lock:
             stale_ids = [cid for cid, entry in self._controllers.items() if now - float(entry.get("last_seen", 0)) > self.stale_seconds]
             for cid in stale_ids:
                 stale_entry = self._controllers.pop(cid, None)
                 if stale_entry is not None:
                     vdbg(f"controller stale remove id={cid} host={stale_entry.get('host')} port={stale_entry.get('port')}")
+                    removed.append(cid)
             for cid, entry in sorted(self._controllers.items()):
                 out.append(self._controller_view(entry, now=now))
+        for cid in removed:
+            self.send_later("LED OFF", target_id=cid, delay_seconds=0.0)
         return out
 
     def _controller_view(self, entry: dict[str, Any], now: Optional[float] = None) -> dict[str, Any]:
@@ -356,6 +360,21 @@ class FeedbackHTTPDispatcher:
             if not entry:
                 return None
             return str(entry.get("host")), int(entry.get("port", DEFAULT_FEEDBACK_PORT))
+
+    def send_later(self, command: str, target_id: Optional[str] = None, delay_seconds: float = 0.15) -> None:
+        command_text = str(command or "").strip()
+        if not command_text:
+            return
+
+        def _worker() -> None:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            try:
+                self.send(command_text, target_id=target_id)
+            except Exception as exc:
+                dbg(f"Delayed feedback send failed for {command_text!r} target={target_id!r}: {exc}")
+
+        threading.Thread(target=_worker, name="feedback-http-send", daemon=True).start()
 
     def _post_event(self, host: str, port: int, command_text: str, target_id: Optional[str]) -> None:
         url = f"http://{host}:{port}/event"
@@ -662,6 +681,7 @@ class WatcherHTTPHandler(BaseHTTPRequestHandler):
                 payload = self._read_json_body()
                 controller = FEEDBACK_DISPATCHER.register_controller(payload, source_ip=self.client_address[0])
                 self._send_json({"ok": True, "controller": controller})
+                FEEDBACK_DISPATCHER.send_later("LED BLINK 700 700", target_id=str(controller.get("id") or ""), delay_seconds=0.20)
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
             except Exception as exc:
@@ -673,6 +693,7 @@ class WatcherHTTPHandler(BaseHTTPRequestHandler):
                 payload = self._read_json_body()
                 controller = FEEDBACK_DISPATCHER.heartbeat_controller(payload, source_ip=self.client_address[0])
                 self._send_json({"ok": True, "controller": controller})
+                FEEDBACK_DISPATCHER.send_later("LED PULSE 80", target_id=str(controller.get("id") or ""), delay_seconds=0.20)
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
             except Exception as exc:
