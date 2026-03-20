@@ -14,10 +14,10 @@ BleGamepad bleGamepad("IControlThem p1", "MAIM", 100);
 // =========================
 // Wi-Fi settings
 // =========================
-constexpr char WIFI_SSID[] = "ThisWifiMakesYouGay";
-constexpr char WIFI_PASS[] = "SylviaRivera";
+constexpr char WIFI_SSID[] = "WIFI_SSID";
+constexpr char WIFI_PASS[] = "WIFI_PASS";
 constexpr uint16_t HTTP_PORT = 4210;
-constexpr char WATCHER_HOST[] = "192.168.1.199";
+constexpr char WATCHER_HOST[] = "WATCHER_HOST";
 constexpr uint16_t WATCHER_PORT = 42069;
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 5000;
 constexpr char CONTROLLER_ID[] = "p1";   // Change per controller: p1, p2, p3, etc.
