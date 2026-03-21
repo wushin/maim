@@ -1,3 +1,4 @@
+
 # MAIM Runtime Architecture
 
 This README describes the architecture of the MAIM RetroArch watcher runtime.
@@ -7,7 +8,7 @@ The system is a **distributed game experience machine** composed of:
 - `main.py` — watcher / telemetry engine / router / HTTP UI
 - `controller.ino` — ESP32 controller node (BLE + haptics + HTTP receiver)
 - `sketch.ino` — UNO console-side effects engine
-- YAML profiles — game-specific telemetry + trigger logic
+- YAML profiles — game-specific telemetry + trigger logic + experience routing
 
 ---
 
@@ -16,7 +17,7 @@ The system is a **distributed game experience machine** composed of:
 The runtime follows a strict pipeline:
 
 ```text
-RetroArch telemetry → trigger rules → event names → routing → device-local behavior
+RetroArch telemetry → trigger rules → experience events → command payloads → routing → device-local behavior
 ```
 
 Each layer has one responsibility.
@@ -25,9 +26,10 @@ Each layer has one responsibility.
 |------|----------------|
 | Telemetry | Raw emulator memory reads |
 | Triggers | Interpret gameplay state |
-| Events | Hardware / experience vocabulary |
+| Events | Experience vocabulary |
+| Commands | Device-understandable instructions |
 | Routing | Decide destination |
-| Receivers | Decide physical expression |
+| Receivers | Execute physical expression |
 
 The watcher is a **director/router**, not a behavior database.
 
@@ -39,16 +41,20 @@ The watcher is a **director/router**, not a behavior database.
 
 The watcher:
 
-- Talks to RetroArch via UDP command interface
+- Talks to RetroArch via command interface
 - Resolves current game and loads the YAML profile
 - Reads configured telemetry fields from emulator RAM
 - Evaluates trigger conditions
 - Emits lifecycle state to the UNO bridge
-- Sends HTTP feedback events to controllers
+- Sends HTTP command payloads to controllers
 - Maintains a live controller routing registry via HTTP register + heartbeat
 - Serves the HTTP status UI and API
 
 It is the **central orchestration runtime**.
+
+The watcher does **not** know how devices implement feedback.
+
+It only sends **commands declared in the profile**.
 
 ---
 
@@ -57,15 +63,22 @@ It is the **central orchestration runtime**.
 Each ESP32 controller:
 
 - Acts as a BLE gamepad
-- Connects to Wi‑Fi
-- Runs an HTTP server for event delivery
+- Connects to Wi-Fi
+- Runs an HTTP server for command delivery
 - Registers itself with the watcher via HTTP
 - Sends periodic HTTP heartbeats
-- Executes local haptic and LED routines when receiving HTTP event commands
+- Executes local haptic / LED routines when receiving command strings
 
-Controllers are **receivers/interpreters**.
+Controllers are **generic experience interpreters**.
 
-They do **not** know game telemetry semantics.
+They only understand **device commands** such as:
+
+```
+RUMBLE 1 180
+PULSE 2 70 50 2
+STOP 1
+REPEAT 3 120 80
+```
 
 ---
 
@@ -75,203 +88,62 @@ The UNO:
 
 - Renders lifecycle states visually
 - Drives the LED matrix marquee
-- Executes pin-level output behaviors
-- Accepts `trigger_event` bridge calls
+- Executes pin-level atmosphere outputs
+- Accepts routed experience events from the watcher
 
 This is the **local experience output path**.
-
-This is where `target: self` events are routed.
 
 ---
 
 ## Controller Presence and Routing
 
-### Controller Registry
-
-Controllers actively register themselves with the watcher using HTTP:
+Controllers register:
 
 ```
 POST /api/controllers/register
 ```
 
-They maintain presence using periodic:
+Maintain presence:
 
 ```
 POST /api/controllers/heartbeat
 ```
 
-The watcher maintains a routing table conceptually like:
+Watcher routing table:
 
-```text
+```
 routing_table[id] -> (host, port, metadata, last_seen)
 ```
 
-This registry is:
-
-- Visible in `/status`
-- Used during event dispatch
-- Updated automatically as controllers heartbeat
-
-No static controller configuration is required.
-
 ---
 
-## Target-Aware Routing
+## Modern Event System
 
-Trigger events support both simple and object forms.
-
-### Simple event
+Profiles define **named experience events**, each containing **device command payloads**.
 
 ```yaml
 events:
-  - HIT_STRONG
+  p1_hp_down_rumble:
+    commands:
+      - command: "RUMBLE 1 180"
+        target: p1
 ```
 
-### Targeted event
-
-```yaml
-events:
-  - name: HIT_STRONG
-    target: p1
-```
-
-### Routing semantics
-
-| target | behavior |
-|--------|----------|
-| `p1` | send HTTP event to controller `p1` |
-| `all` | send to all registered controllers |
-| `self` | route to UNO bridge local effects |
-| omitted | fall back to legacy configured targets |
+Triggers reference event names.
 
 ---
 
 ## Event Delivery Protocol
 
-Controller events are delivered via HTTP JSON.
-
-Example:
-
-```text
+```
 POST http://<controller-host>:<port>/event
 ```
 
 Body:
 
 ```json
-{ "event": "HIT_STRONG" }
+{ "event": "RUMBLE 1 180" }
 ```
-
-Targeting is resolved watcher‑side.
-
----
-
-## Event Normalization
-
-The watcher supports:
-
-- string events
-- object events
-- legacy event definitions
-- fallback event-name dispatch
-
-Valid examples:
-
-```yaml
-- HIT_STRONG
-```
-
-```yaml
-- name: HIT_STRONG
-  target: p1
-```
-
-```yaml
-- name: HIT_STRONG
-  target: self
-```
-
----
-
-## Trigger Engine Flow
-
-```text
-snapshot -> compare previous -> condition matched -> normalize event -> route -> dispatch
-```
-
-Supported comparisons include:
-
-- `increased`
-- `decreased`
-- `changed`
-- `equal`
-- `above`
-- `below`
-- `crossed_above`
-- `crossed_below`
-- delta comparisons
-
----
-
-## Experience Vocabulary Philosophy
-
-Profiles translate **game facts into experience events**.
-
-Example:
-
-Game fact:
-
-```text
-p1_hp decreased
-```
-
-Experience event:
-
-```text
-HIT_STRONG
-```
-
-The controller decides how to physically express that event.
-
----
-
-## Example Modern Profile
-
-```yaml
-triggers:
-  - name: p1_hp_down
-    when:
-      field: p1_hp
-      compare: decreased
-    events:
-      - name: HIT_STRONG
-        target: p1
-```
-
----
-
-## UNO Local Routing Example
-
-```yaml
-events:
-  - name: FOG_PULSE
-    target: self
-```
-
-Watcher behavior:
-
-- does **not** send controller HTTP event
-- calls the UNO bridge
-- UNO performs the hardware action
-
----
-
-## Ports
-
-| Port | Purpose |
-|------|---------|
-| `42069` | HTTP UI |
-| Controller HTTP Port | Event delivery + heartbeat |
 
 ---
 
@@ -279,25 +151,14 @@ Watcher behavior:
 
 MAIM is a **distributed game experience runtime**.
 
-- PC = telemetry intelligence + routing
-- Controllers = tactile feedback nodes
-- UNO = atmospheric console effects
+- UNO Debian = telemetry intelligence + routing
+- Controllers = tactile feedback interpreters
+- UNO Arduino = atmospheric console effects
 
 Key principles:
 
 - Telemetry stays game-specific
-- Events stay experience-specific
+- Experience events stay semantic
+- Commands stay device-specific
 - Routing stays centralized
-- Behavior stays local
-
----
-
-## Future Runtime Evolution
-
-Likely next maturity steps:
-
-- Controller TTL / stale eviction
-- Routing metrics
-- Profile hot reload
-- Capability negotiation
-- Event priority / rate limiting
+- Behavior stays local  

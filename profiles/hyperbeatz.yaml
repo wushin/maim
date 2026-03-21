@@ -1,6 +1,7 @@
 game: hyperbeatz
 system: nes
 poll_seconds: 0.10
+
 telemetry:
   fields:
     p1_hp: { addr: 0x0035, type: u8 }
@@ -14,35 +15,52 @@ telemetry:
     p1_good: { addr: 0x0752, type: u8 }
     p1_nice: { addr: 0x0754, type: u8 }
 
+events:
+  p1_hp_down_rumble:
+    commands:
+      - command: "RUMBLE 1 180"
+        target: p1
+
+  p1_hp_up_stop:
+    commands:
+      - command: "STOP 1"
+        target: p1
+
+  p1_nice_pulse:
+    commands:
+      - command: "PULSE 2 70 50 2"
+        target: p1
+
+  p1_miss_pulse:
+    commands:
+      - command: "PULSE 3 220 90 1"
+        target: p1
+
 triggers:
   - name: p1_hp_down
     when:
       field: p1_hp
       compare: decreased
     events:
-      - name: HIT_STRONG
-        target: p1
+      - name: p1_hp_down_rumble
 
   - name: p1_hp_up
     when:
       field: p1_hp
       compare: increased
     events:
-      - name: RELEASE
-        target: p1
+      - name: p1_hp_up_stop
 
   - name: p1_nice_incremented
     when:
       field: p1_nice
       compare: increased
     events:
-      - name: PULSE_DOUBLE_SHORT
-        target: p1
+      - name: p1_nice_pulse
 
   - name: p1_miss_incremented
     when:
       field: p1_miss
       compare: increased
     events:
-      - name: PULSE_SINGLE_LONG
-        target: p1
+      - name: p1_miss_pulse

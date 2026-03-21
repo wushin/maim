@@ -64,9 +64,6 @@ constexpr uint8_t rumblePins[RUMBLE_COUNT] = {
 // ESP32-WROOM dev boards commonly expose this on GPIO 2
 // =========================
 constexpr uint8_t PIN_STATUS_LED = 2;
-constexpr uint8_t PIN_LED_R = PIN_STATUS_LED;
-constexpr uint8_t PIN_LED_G = PIN_STATUS_LED;
-constexpr uint8_t PIN_LED_B = PIN_STATUS_LED;
 
 // =========================
 // BLE state tracking
@@ -294,10 +291,6 @@ void setStatusLed(bool on) {
   ledOutputState = on;
 }
 
-void setRgb(bool r, bool g, bool b) {
-  setStatusLed(r || g || b);
-}
-
 void rgbOff() {
   setStatusLed(false);
 }
@@ -428,38 +421,6 @@ String getToken(const String& input, int index) {
   }
 }
 
-void handleNamedEvent(const String& cmd) {
-  DBG_PRINT("[EVENT] Named event: ");
-  DBG_PRINTLN(cmd);
-  if (cmd == "HIT_STRONG") {
-    for (uint8_t i = 0; i < RUMBLE_COUNT; i++) {
-      startMotorTimedRumble(i, 140);
-    }
-    return;
-  }
-
-  if (cmd == "HIT_LIGHT") {
-    startMotorTimedRumble(1, 50); // motor 2 only
-    return;
-  }
-
-  if (cmd == "DOUBLE_TAP") {
-    startMotorPulse(0, 40, 40, 2);
-    startMotorPulse(2, 40, 40, 2);
-    return;
-  }
-
-  if (cmd == "RUMBLE_ALERT_ON") {
-    startMotorRepeatingPattern(0, 120, 280);
-    return;
-  }
-
-  if (cmd == "RUMBLE_ALERT_OFF") {
-    stopMotorRepeatingPattern(0);
-    return;
-  }
-}
-
 void processCommand(String cmd, const char* sourceTag) {
   cmd.trim();
   if (cmd.length() == 0) return;
@@ -468,15 +429,6 @@ void processCommand(String cmd, const char* sourceTag) {
   DBG_PRINT(sourceTag);
   DBG_PRINT("] -> ");
   DBG_PRINTLN(cmd);
-
-  if (cmd == "HIT_STRONG" ||
-      cmd == "HIT_LIGHT" ||
-      cmd == "DOUBLE_TAP" ||
-      cmd == "RUMBLE_ALERT_ON" ||
-      cmd == "RUMBLE_ALERT_OFF") {
-    handleNamedEvent(cmd);
-    return;
-  }
 
   if (cmd == "STOP_ALL") {
     stopAllMotors();
@@ -577,17 +529,6 @@ void processCommand(String cmd, const char* sourceTag) {
 
   if (cmd.startsWith("STATE ")) {
     setLifecycleState(getToken(cmd, 1));
-    return;
-  }
-
-  if (cmd.startsWith("RGB ")) {
-    int r = getToken(cmd, 1).toInt();
-    int g = getToken(cmd, 2).toInt();
-    int b = getToken(cmd, 3).toInt();
-    setRgb(r != 0, g != 0, b != 0);
-    DBG_PRINT("[RGB] r="); DBG_PRINT(r);
-    DBG_PRINT(" g="); DBG_PRINT(g);
-    DBG_PRINT(" b="); DBG_PRINTLN(b);
     return;
   }
 
@@ -858,9 +799,6 @@ void setup() {
     digitalWrite(rumblePins[i], LOW);
   }
 
-  pinMode(PIN_LED_R, OUTPUT);
-  pinMode(PIN_LED_G, OUTPUT);
-  pinMode(PIN_LED_B, OUTPUT);
   rgbOff();
 
   BleGamepadConfiguration cfg;
